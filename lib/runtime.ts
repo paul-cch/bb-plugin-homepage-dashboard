@@ -1,119 +1,57 @@
-// Shared, serializable shapes for the runtime dashboard snapshot.
+// Shared, serializable shapes for the live homelab dashboard snapshot.
 // Kept free of backend-only imports so both the server (builder) and the
 // frontend (renderer) can depend on it. Every field is a primitive so the
-// object survives JSON wire serialization and z.unknown() validation.
+// object survives JSON wire serialization.
 
-export interface ServerSummary {
-  version: string;
-  hasAttention: boolean;
-}
+export type ProbeKind =
+  | "app"
+  | "service"
+  | "infra"
+  | "remote"
+  | "operator";
 
-export interface ProjectSummary {
+export type ProbeStatus =
+  | "up" // responded with a 2xx status in time
+  | "down" // responded with a non-2xx status, or DNS/TLS/connection error
+  | "timeout" // exceeded the probe budget
+  | "unverified"; // no reachable health route documented; source claim only
+
+export interface ProbeResult {
   id: string;
   name: string;
-  kind: string; // "standard" | "personal"
-  gitRemoteUrl: string | null;
-  sourceCount: number;
+  kind: ProbeKind;
+  host: string;
+  url: string;
+  note: string;
+  /** Final live status for this probe. */
+  status: ProbeStatus;
+  /** HTTP status code when we got an HTTP response, else null. */
+  httpStatus: number | null;
+  /** Milliseconds the probe took (round-trip), or null on failure. */
+  latencyMs: number | null;
+  /** Short human reason when not up (error class or status). */
+  detail: string | null;
 }
 
-export interface ThreadRow {
-  id: string;
-  title: string | null;
-  status: string; // active | idle | error | stopping | starting
-  projectId: string;
-  providerId: string;
-  environmentId: string | null;
-  updatedAt: number; // epoch ms, 0 when unknown
+export interface HomelabSnapshot {
+  /** Epoch ms when the probe batch finished. */
+  generatedAt: number;
+  /** How long the slowest single probe took (ms). */
+  slowestMs: number;
+  /** Non-fatal area errors (e.g. fetch unavailable), for transparency. */
+  errors: string[];
+  /** Per-target live probe results. */
+  probes: ProbeResult[];
+  /** Roll-up counts derived on the server. */
+  summary: {
+    total: number;
+    up: number;
+    down: number;
+    timeout: number;
+    unverified: number;
+  };
 }
 
-export interface ThreadSummary {
-  total: number;
-  active: number;
-  idle: number;
-  error: number;
-  other: number;
-  recent: ThreadRow[];
-}
-
-export interface HostSummary {
-  id: string;
-  name: string;
-  type: string; // persistent | ...
-  status: string; // connected | disconnected | ...
-}
-
-// Note: bb's terminals API requires an explicit scope (thread / environment /
-// host_path) and has no global list, so a single global terminal count is not
-// available through the SDK. The dashboard surfaces the other global surfaces
-// instead.
-
-export interface ProviderSummary {
-  id: string;
-  displayName: string;
-  supportsServiceTier: boolean;
-}
-
-export interface PluginSummary {
-  id: string;
-  source: string; // builtin:... | path:... | git:... | npm:...
-  provenance: string;
-  version: string;
-  isOrphanedBuiltin: boolean;
-  updateOutcome: string | null;
-}
-
-export interface RuntimeSnapshot {
-  generatedAt: number; // epoch ms
-  errors: string[]; // non-fatal area errors, for transparency
-  server: ServerSummary;
-  projects: ProjectSummary[];
-  threads: ThreadSummary;
-  hosts: HostSummary[];
-  providers: ProviderSummary[];
-  plugins: PluginSummary[];
-}
-
-// Loose structural views of SDK results. The SDK DTOs vary across bb
-// releases, so we map from these optional shapes rather than importing the
-// exact SDK types (which would drag backend-only code into the frontend).
-export interface ThreadLike {
-  id?: string;
-  title?: string | null;
-  status?: string;
-  projectId?: string;
-  providerId?: string;
-  environmentId?: string | null;
-  updatedAt?: number;
-}
-
-export interface ProjectLike {
-  id?: string;
-  name?: string;
-  kind?: string;
-  gitRemoteUrl?: string | null;
-  sources?: unknown[];
-}
-
-export interface HostLike {
-  id?: string;
-  name?: string;
-  type?: string;
-  status?: string;
-}
-
-export interface ProviderLike {
-  id?: string;
-  displayName?: string;
-  capabilities?: { supportsServiceTier?: boolean };
-}
-
-export interface PluginLike {
-  id?: string;
-  source?: string;
-  provenance?: string;
-  version?: string;
-  isOrphanedBuiltin?: boolean;
-  updateState?: { outcome?: string } | null;
-}
-
+// Loose structural views of SDK results used by the legacy bb-runtime
+// surface (kept so the backend never drags SDK types into the frontend).
 export const REALTIME_CHANNEL = "homepage-dashboard:snapshot";

@@ -1,15 +1,16 @@
 // bb-plugin-homepage-dashboard — frontend entry.
 //
 // Compiled by `bb plugin build` into dist/app.js + dist/app.css. React and
-// @get-bb/plugin-sdk/app are provided by the BB app at load time (never bundled),
-// so this file must be loaded by BB, not imported directly.
+// @get-bb/plugin-sdk/app are provided by the BB app at load time (never bundled).
 //
-// The dashboard pulls a runtime snapshot over RPC and keeps it live via the
-// plugin's realtime signal plus a refresh on realtime reconnection.
-import { useCallback, useEffect, useRef, useState } from "react";
-import { definePluginApp, useBbContext, useBbNavigate, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
+// The dashboard pulls a live homelab snapshot over RPC (real HTTP probe
+// results from the bb server) and keeps it live via the plugin's realtime
+// signal plus a refetch on realtime reconnection. It shows what is ACTUALLY
+// up on the estate, not what the source claims should be.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import { REALTIME_CHANNEL, type RuntimeSnapshot } from "./lib/runtime";
+import { REALTIME_CHANNEL, type HomelabSnapshot, type ProbeKind, type ProbeResult, type ProbeStatus } from "./lib/runtime";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
@@ -27,6 +28,19 @@ function StatusPill({ tone, label }: { tone: "ok" | "warn" | "bad" | "muted"; la
   );
 }
 
+function probeTone(status: ProbeStatus): "ok" | "warn" | "bad" | "muted" {
+  switch (status) {
+    case "up":
+      return "ok";
+    case "timeout":
+      return "warn";
+    case "down":
+      return "bad";
+    default:
+      return "muted";
+  }
+}
+
 function Kpi({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
   return (
     <div className="rounded-lg border bg-card p-3">
@@ -40,7 +54,7 @@ function Kpi({ label, value, sub }: { label: string; value: string | number; sub
 function useSnapshot() {
   const rpc = useRpc<typeof rpcContract>();
   const conn = useRealtimeConnectionState();
-  const [snapshot, setSnapshot] = useState<RuntimeSnapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<HomelabSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const inFlight = useRef(false);
@@ -51,7 +65,7 @@ function useSnapshot() {
     setLoading(true);
     try {
       const { snapshot: snap } = await rpc.call("getSnapshot");
-      setSnapshot((snap as RuntimeSnapshot | null) ?? null);
+      setSnapshot((snap as HomelabSnapshot | null) ?? null);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -61,13 +75,11 @@ function useSnapshot() {
     }
   }, [rpc]);
 
-  // Initial load + refresh on the plugin's broadcast signal.
   useEffect(() => {
     void load();
   }, [load]);
   useRealtime(REALTIME_CHANNEL, () => void load());
 
-  // Reconciliation: after a reconnection the snapshot may be stale, refetch.
   const wasConnected = useRef(conn);
   useEffect(() => {
     if (conn === "connected" && wasConnected.current !== "connected") void load();
@@ -77,23 +89,62 @@ function useSnapshot() {
   return { snapshot, loading, error, reload: load };
 }
 
-function ThreadStatusBadge({ status }: { status: string }) {
-  const tone = status === "active" ? "ok" : status === "error" ? "bad" : status === "idle" ? "muted" : "warn";
-  return <StatusPill tone={tone} label={status} />;
+// Group probes by the host/VM node they live on, preserving a sensible order.
+function groupByHost(probes: ProbeResult[]): Array<{ host: string; items: ProbeResult[] }> {
+  const order: string[] = [];
+  const map = new Map<string, ProbeResult[]>();
+  for (const p of probes) {
+    if (!map.has(p.host)) {
+      map.set(p.host, []);
+      order.push(p.host);
+    }
+    map.get(p.host)!.push(p);
+  }
+  return order.map((host) => ({ host, items: map.get(host)! }));
+}
+
+const KIND_LABEL: Record<ProbeKind, string> = {
+  app: "App",
+  service: "Service",
+  infra: "Infra",
+  remote: "Remote",
+  operator: "Operator",
+};
+
+function ProbeRow({ p }: { p: ProbeResult }) {
+  return (
+    <div className="flex items-center justify-between gap-2 py-1">
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="truncate font-medium">{p.name}</span>
+          <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{KIND_LABEL[p.kind]}</span>
+        </div>
+        <div className="truncate text-xs text-muted-foreground">{p.url}</div>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        {p.latencyMs != null ? <span className="tabular-nums text-xs text-muted-foreground">{p.latencyMs}ms</span> : null}
+        <StatusPill tone={probeTone(p.status)} label={p.status} />
+      </div>
+    </div>
+  );
 }
 
 function FullDashboard() {
   const { snapshot, loading, error, reload } = useSnapshot();
-  const navigate = useBbNavigate();
+
+  const groups = useMemo(
+    () => (snapshot ? groupByHost(snapshot.probes) : []),
+    [snapshot],
+  );
 
   return (
     <div className="p-4 md:p-5">
       <div className="mx-auto w-full max-w-5xl space-y-4">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-lg font-semibold">Runtime Dashboard</h1>
+            <h1 className="text-lg font-semibold">Homelab — Live State</h1>
             <p className="text-sm text-muted-foreground">
-              Live state of the running bb instance
+              Real HTTP probes from the bb server
               {snapshot ? ` · updated ${new Date(snapshot.generatedAt).toLocaleTimeString()}` : ""}
             </p>
           </div>
@@ -104,138 +155,44 @@ function FullDashboard() {
 
         {error ? (
           <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-600 dark:text-red-400">
-            Failed to load runtime state: {error}
+            Failed to load live state: {error}
           </div>
         ) : null}
 
         {!snapshot ? (
           <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground">
-            {loading ? "Loading runtime state…" : "No snapshot available."}
+            {loading ? "Probing homelab endpoints…" : "No snapshot available."}
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-              <Kpi label="bb version" value={snapshot.server.version} sub={snapshot.server.hasAttention ? "attention requested" : "no attention"} />
-              <Kpi label="Projects" value={snapshot.projects.length} />
-              <Kpi
-                label="Threads"
-                value={snapshot.threads.total}
-                sub={`${snapshot.threads.active} active · ${snapshot.threads.idle} idle`}
-              />
-              <Kpi label="Hosts" value={snapshot.hosts.length} sub={`${snapshot.hosts.filter((h) => h.status === "connected").length} connected`} />
-              <Kpi label="Providers" value={snapshot.providers.length} />
-              <Kpi label="Plugins" value={snapshot.plugins.length} sub={`${snapshot.plugins.filter((p) => p.source.startsWith("builtin")).length} builtin`} />
-              <Kpi label="Thread errors" value={snapshot.threads.error} sub={snapshot.threads.error ? "needs review" : "none"} />
-              <Kpi label="Orphaned builtins" value={snapshot.plugins.filter((p) => p.isOrphanedBuiltin).length} />
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <Kpi label="Services up" value={`${snapshot.summary.up}/${snapshot.summary.total}`} sub="probed live" />
+              <Kpi label="Down" value={snapshot.summary.down} sub={snapshot.summary.down ? "needs attention" : "none"} />
+              <Kpi label="Timeout" value={snapshot.summary.timeout} />
+              <Kpi label="Slowest" value={`${snapshot.slowestMs}ms`} />
             </div>
 
-            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Hosts</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-2 text-sm">
-                  {snapshot.hosts.length === 0 ? (
-                    <div className="text-muted-foreground">No hosts.</div>
-                  ) : (
-                    snapshot.hosts.map((h) => (
-                      <div key={h.id} className="flex items-center justify-between gap-2">
-                        <span className="truncate">{h.name}</span>
-                        <StatusPill
-                          tone={h.status === "connected" ? "ok" : h.status === "disconnected" ? "bad" : "muted"}
-                          label={h.status}
-                        />
-                      </div>
-                    ))
-                  )}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <CardTitle>Providers</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-2 text-sm">
-                  {snapshot.providers.length === 0 ? (
-                    <div className="text-muted-foreground">No providers.</div>
-                  ) : (
-                    snapshot.providers.map((p) => (
-                      <div key={p.id} className="flex items-center justify-between gap-2">
-                        <span className="truncate">{p.displayName}</span>
-                        <StatusPill tone="muted" label={p.supportsServiceTier ? "tiers" : "flat"} />
-                      </div>
-                    ))
-                  )}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <CardTitle>Plugins</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-2 text-sm">
-                  {snapshot.plugins.map((p) => (
-                    <div key={p.id} className="flex items-center justify-between gap-2">
-                      <span className="truncate">
-                        {p.id} <span className="text-muted-foreground">v{p.version}</span>
-                      </span>
+            {groups.map((group) => {
+              const up = group.items.filter((i) => i.status === "up").length;
+              return (
+                <Card key={group.host}>
+                  <CardHeader>
+                    <CardTitle className="flex items-center justify-between text-base">
+                      <span>{group.host}</span>
                       <StatusPill
-                        tone={
-                          p.source.startsWith("builtin")
-                            ? "ok"
-                            : p.updateOutcome && p.updateOutcome !== "current"
-                              ? "warn"
-                              : "muted"
-                        }
-                        label={p.source.startsWith("builtin") ? "builtin" : p.provenance}
+                        tone={up === group.items.length ? "ok" : up > 0 ? "warn" : "bad"}
+                        label={`${up}/${group.items.length} up`}
                       />
-                    </div>
-                  ))}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <CardTitle>Recent threads</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-2 text-sm">
-                  {snapshot.threads.recent.length === 0 ? (
-                    <div className="text-muted-foreground">No threads.</div>
-                  ) : (
-                    snapshot.threads.recent.map((t) => (
-                      <button
-                        key={t.id}
-                        type="button"
-                        onClick={() => navigate.toThread(t.id)}
-                        className="flex w-full items-center justify-between gap-2 rounded px-1 py-1 text-left hover:bg-muted"
-                      >
-                        <span className="truncate">{t.title ?? "(untitled)"}</span>
-                        <ThreadStatusBadge status={t.status} />
-                      </button>
-                    ))
-                  )}
-                </CardContent>
-              </Card>
-            </div>
-
-            {snapshot.projects.length > 0 ? (
-              <Card>
-                <CardHeader>
-                  <CardTitle>Projects</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-2 text-sm">
-                  {snapshot.projects.map((p) => (
-                    <div key={p.id} className="flex items-center justify-between gap-2">
-                      <span className="truncate">
-                        {p.name} <span className="text-muted-foreground">· {p.kind}</span>
-                        {p.gitRemoteUrl ? <span className="text-muted-foreground"> · git</span> : null}
-                      </span>
-                      <StatusPill tone="muted" label={`${p.sourceCount} src`} />
-                    </div>
-                  ))}
-                </CardContent>
-              </Card>
-            ) : null}
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="divide-y text-sm">
+                    {group.items.map((p) => (
+                      <ProbeRow key={p.id} p={p} />
+                    ))}
+                  </CardContent>
+                </Card>
+              );
+            })}
 
             {snapshot.errors.length > 0 ? (
               <Card>
@@ -251,6 +208,11 @@ function FullDashboard() {
                 </CardContent>
               </Card>
             ) : null}
+
+            <p className="text-xs text-muted-foreground">
+              Green = the service answered its health route from the bb server's network. These are
+              live reachability probes, independent of the repo's source claims.
+            </p>
           </>
         )}
       </div>
@@ -259,17 +221,12 @@ function FullDashboard() {
 }
 
 function HomepageSection() {
-  const { projectId } = useBbContext();
   const { snapshot, loading, error, reload } = useSnapshot();
-  const navigate = useBbNavigate();
-
-  // `projectId` is part of the slot contract; used to scope a footer hint.
-  const scopeHint = projectId === null ? "no project selected" : "project in view";
 
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
-        <CardTitle>Runtime state</CardTitle>
+        <CardTitle>Homelab — Live</CardTitle>
         <Button size="sm" variant="outline" onClick={() => void reload()} disabled={loading}>
           {loading ? "…" : "Refresh"}
         </Button>
@@ -278,22 +235,29 @@ function HomepageSection() {
         {error ? (
           <div className="text-red-600 dark:text-red-400">Failed to load: {error}</div>
         ) : !snapshot ? (
-          <div className="text-muted-foreground">{loading ? "Loading…" : "No snapshot."}</div>
+          <div className="text-muted-foreground">{loading ? "Probing…" : "No snapshot."}</div>
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              <Kpi label="Threads" value={snapshot.threads.total} sub={`${snapshot.threads.active} active`} />
-              <Kpi label="Hosts" value={snapshot.hosts.length} sub={`${snapshot.hosts.filter((h) => h.status === "connected").length} up`} />
-              <Kpi label="Plugins" value={snapshot.plugins.length} />
-              <Kpi label="version" value={snapshot.server.version} />
+            <div className="grid grid-cols-3 gap-2">
+              <Kpi label="Up" value={`${snapshot.summary.up}/${snapshot.summary.total}`} />
+              <Kpi label="Down" value={snapshot.summary.down} />
+              <Kpi label="Slowest" value={`${snapshot.slowestMs}ms`} />
             </div>
             <div className="flex flex-wrap items-center gap-2 text-xs">
-              {snapshot.threads.error > 0 ? <StatusPill tone="bad" label={`${snapshot.threads.error} thread errors`} /> : null}
-              {snapshot.server.hasAttention ? <StatusPill tone="warn" label="attention requested" /> : null}
-              <StatusPill tone="muted" label={scopeHint} />
+              {snapshot.probes.slice(0, 8).map((p) => (
+                <StatusPill key={p.id} tone={probeTone(p.status)} label={p.name} />
+              ))}
+              {snapshot.probes.length > 8 ? (
+                <StatusPill tone="muted" label={`+${snapshot.probes.length - 8} more`} />
+              ) : null}
             </div>
-            <Button size="sm" variant="link" className="px-0" onClick={() => navigate.toPluginPanel("dashboard")}>
-              Open full dashboard →
+            <Button
+              size="sm"
+              variant="link"
+              className="px-0"
+              onClick={() => window.location.assign("#/plugins/homepage-dashboard")}
+            >
+              Open full live view →
             </Button>
           </>
         )}
@@ -305,13 +269,13 @@ function HomepageSection() {
 export default definePluginApp((app) => {
   app.slots.homepageSection({
     id: "homepage-dashboard",
-    title: "Runtime Dashboard",
+    title: "Homelab — Live",
     component: HomepageSection,
   });
 
   app.slots.navPanel({
     id: "dashboard",
-    title: "Runtime Dashboard",
+    title: "Homelab — Live",
     icon: "Activity",
     path: "dashboard",
     component: FullDashboard,

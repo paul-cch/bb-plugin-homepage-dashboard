@@ -7,8 +7,8 @@
     "bbPluginSdk": ">=0.4.6"
   },
   "bb": {
-    "name": "Homepage Dashboard",
-    "description": "A homepage section and panel showing live runtime state of the running bb instance (server, projects, threads, hosts, providers, plugins).",
+    "name": "Homelab Live Dashboard",
+    "description": "A homepage section and nav panel showing the LIVE state of the homelab estate — real HTTP health probes of services, VMs, and remote nodes (OpenClaw, Basic Memory, Home Assistant, n8n, SearXNG, Kaneo, Gitea, Immich, blog), refreshed on an interval and over realtime.",
     "branding": {
       "icon": "Activity"
     },

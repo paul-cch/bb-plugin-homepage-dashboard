@@ -1,186 +1,152 @@
 // bb-plugin-homepage-dashboard — backend entry.
 //
-// Gathers a live snapshot of the running bb runtime (server, projects,
-// threads, hosts, providers, plugins) and serves it over RPC. A background
-// poller refreshes the snapshot on an interval and broadcasts a realtime
-// signal so the UI can pull a fresh copy without polling. The frontend never
-// imports this module's implementation — only the RPC contract type and the
-// shared serializable shapes in lib/runtime.ts.
+// Probes the live homelab estate over HTTP from the bb server (which sits on
+// Paul's network) and serves the real results over RPC. A background poller
+// refreshes the probes on an interval and broadcasts a realtime signal so the
+// UI stays live without polling. The frontend never imports this module — only
+// the shared serializable shapes in lib/runtime.ts.
+//
+// This is genuine live proof, not source claims: a green dot means the service
+// actually answered a health route from the server's network. Source truth
+// (runtime-truth-map.json) only seeds the inventory of WHAT to probe.
 
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 import {
   REALTIME_CHANNEL,
-  type HostLike,
-  type PluginLike,
-  type ProviderLike,
-  type ProjectLike,
-  type RuntimeSnapshot,
-  type ThreadLike,
+  type HomelabSnapshot,
+  type ProbeKind,
+  type ProbeResult,
+  type ProbeStatus,
 } from "./lib/runtime";
+import { HOMELAB_TARGETS } from "./lib/homelab-endpoints";
 
-const POLL_INTERVAL_MS = 20_000;
+const POLL_INTERVAL_MS = 30_000;
+const PROBE_TIMEOUT_MS = 6_000;
 
 export const rpcContract = defineRpcContract({
   getSnapshot: {
-    input: z.null(), // null input lets the frontend omit the argument
-    output: z.object({
-      snapshot: z.unknown(),
-    }),
+    input: z.null(),
+    output: z.object({ snapshot: z.unknown() }),
   },
 });
 
-type Maybe<T> = T | undefined;
+interface FetchLike {
+  (input: string, init?: { signal?: AbortSignal }): Promise<{
+    ok: boolean;
+    status: number;
+  }>;
+}
 
-// Safe wrapper: inference keeps the awaited success type separate from the
-// supplied fallback type, so we can pass a structurally different fallback
-// (e.g. an empty object) without forcing the success result to that shape.
-async function safe<Success, Fallback>(
-  fn: () => Promise<Success>,
-  fallback: Fallback,
-  errors: string[],
-  label: string,
-): Promise<Success | Fallback> {
+function getFetch(): FetchLike | null {
+  const g = globalThis as unknown as { fetch?: FetchLike };
+  return typeof g.fetch === "function" ? g.fetch : null;
+}
+
+async function probeOne(
+  target: (typeof HOMELAB_TARGETS)[number],
+  fetchFn: FetchLike,
+): Promise<ProbeResult> {
+  const started = Date.now();
   try {
-    return await fn();
-  } catch (err) {
-    errors.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
-    return fallback;
-  }
-}
-
-function asArray<T>(value: unknown): T[] {
-  return Array.isArray(value) ? (value as T[]) : [];
-}
-
-// Some SDK list results arrive wrapped in an object (e.g. { plugins: [...] }).
-// Unwrap a known single-array key when the value is not itself an array.
-function unwrapKey<T>(value: unknown, key: string): T[] {
-  if (Array.isArray(value)) return value as T[];
-  if (value && typeof value === "object" && Array.isArray((value as Record<string, unknown>)[key])) {
-    return (value as Record<string, unknown>)[key] as T[];
-  }
-  return [];
-}
-
-// Optional, release-dependent SDK surface. Guard every access so the plugin
-// loads on bb versions that do not expose it.
-interface SdkWithRealtime {
-  realtime?: { subscribe: (args: unknown) => () => void };
-}
-
-async function buildSnapshot(bb: BbPluginApi): Promise<RuntimeSnapshot> {
-  const errors: string[] = [];
-  const sdk = bb.sdk;
-
-  const [serverVersion, attention] = await Promise.all([
-    safe(() => sdk.system.version(), { version: "unknown" } as { version: string }, errors, "system.version"),
-    safe(() => sdk.system.attention({}), { hasAttention: false } as { hasAttention: boolean }, errors, "system.attention"),
-  ]);
-
-  const [projectsRaw, threadsRaw, hostsRaw, providersRaw, pluginsRaw] = await Promise.all([
-    safe(() => sdk.projects.list({ includePersonal: true }), [], errors, "projects.list"),
-    safe(() => sdk.threads.list({ limit: 100 }), [], errors, "threads.list"),
-    safe(() => sdk.hosts.list(), [], errors, "hosts.list"),
-    safe(() => sdk.providers.list(), [], errors, "providers.list"),
-    safe(() => sdk.plugins.list(), { plugins: [] }, errors, "plugins.list"),
-  ]);
-
-  const projects = asArray<ProjectLike>(projectsRaw);
-  const threads = asArray<ThreadLike>(threadsRaw);
-  const hosts = asArray<HostLike>(hostsRaw);
-  const providers = asArray<ProviderLike>(providersRaw);
-  const plugins = unwrapKey<PluginLike>(pluginsRaw, "plugins");
-
-  // Thread aggregation.
-  let active = 0;
-  let idle = 0;
-  let errorCount = 0;
-  let other = 0;
-  for (const t of threads) {
-    switch (t.status) {
-      case "active":
-        active++;
-        break;
-      case "idle":
-        idle++;
-        break;
-      case "error":
-        errorCount++;
-        break;
-      default:
-        other++;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+    let httpStatus: number | null = null;
+    let up = false;
+    try {
+      const res = await fetchFn(target.url, { signal: controller.signal });
+      httpStatus = res.status;
+      up = res.status >= 200 && res.status < 300;
+    } finally {
+      clearTimeout(timer);
     }
+    const latencyMs = Date.now() - started;
+    const status: ProbeStatus = up ? "up" : "down";
+    return {
+      id: target.id,
+      name: target.name,
+      kind: target.kind,
+      host: target.host,
+      url: target.url,
+      note: target.note,
+      status,
+      httpStatus,
+      latencyMs,
+      detail: up ? null : `HTTP ${httpStatus ?? "?"}`,
+    };
+  } catch (err) {
+    const latencyMs = Date.now() - started;
+    const aborted = err instanceof Error && err.name === "AbortError";
+    const status: ProbeStatus = aborted ? "timeout" : "down";
+    return {
+      id: target.id,
+      name: target.name,
+      kind: target.kind,
+      host: target.host,
+      url: target.url,
+      note: target.note,
+      status,
+      httpStatus: null,
+      latencyMs: aborted ? PROBE_TIMEOUT_MS : latencyMs,
+      detail: aborted ? `timeout >${PROBE_TIMEOUT_MS}ms` : err instanceof Error ? err.message : String(err),
+    };
   }
-  const recent = [...threads]
-    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
-    .slice(0, 8)
-    .map((t) => ({
-      id: t.id ?? "",
-      title: t.title ?? null,
-      status: t.status ?? "unknown",
-      projectId: t.projectId ?? "",
-      providerId: t.providerId ?? "",
-      environmentId: t.environmentId ?? null,
-      updatedAt: t.updatedAt ?? 0,
+}
+
+async function buildSnapshot(): Promise<HomelabSnapshot> {
+  const errors: string[] = [];
+  const fetchFn = getFetch();
+  let probes: ProbeResult[];
+
+  if (!fetchFn) {
+    errors.push("global fetch unavailable in this bb release — cannot probe live state");
+    probes = HOMELAB_TARGETS.map((t) => ({
+      id: t.id,
+      name: t.name,
+      kind: t.kind as ProbeKind,
+      host: t.host,
+      url: t.url,
+      note: t.note,
+      status: "unverified" as ProbeStatus,
+      httpStatus: null,
+      latencyMs: null,
+      detail: "probe engine unavailable",
     }));
+  } else {
+    // Fan out all probes concurrently; one failure never blocks the others.
+    probes = await Promise.all(HOMELAB_TARGETS.map((t) => probeOne(t, fetchFn)));
+  }
+
+  const summary = {
+    total: probes.length,
+    up: probes.filter((p) => p.status === "up").length,
+    down: probes.filter((p) => p.status === "down").length,
+    timeout: probes.filter((p) => p.status === "timeout").length,
+    unverified: probes.filter((p) => p.status === "unverified").length,
+  };
+  const slowestMs = probes.reduce((max, p) => Math.max(max, p.latencyMs ?? 0), 0);
 
   return {
     generatedAt: Date.now(),
+    slowestMs,
     errors,
-    server: {
-      version: (serverVersion as { currentVersion?: string })?.currentVersion ?? "unknown",
-      hasAttention: (attention as { hasAttention?: boolean })?.hasAttention ?? false,
-    },
-    projects: projects.map((p) => ({
-      id: p.id ?? "",
-      name: p.name ?? "(unnamed)",
-      kind: p.kind ?? "standard",
-      gitRemoteUrl: p.gitRemoteUrl ?? null,
-      sourceCount: Array.isArray(p.sources) ? p.sources.length : 0,
-    })),
-    threads: {
-      total: threads.length,
-      active,
-      idle,
-      error: errorCount,
-      other,
-      recent,
-    },
-    hosts: hosts.map((h) => ({
-      id: h.id ?? "",
-      name: h.name ?? "(unknown host)",
-      type: h.type ?? "unknown",
-      status: h.status ?? "unknown",
-    })),
-    providers: providers.map((p) => ({
-      id: p.id ?? "",
-      displayName: p.displayName ?? p.id ?? "(unknown)",
-      supportsServiceTier: Boolean(p.capabilities?.supportsServiceTier),
-    })),
-    plugins: plugins.map((p) => ({
-      id: p.id ?? "",
-      source: p.source ?? "unknown",
-      provenance: p.provenance ?? "unknown",
-      version: p.version ?? "unknown",
-      isOrphanedBuiltin: Boolean(p.isOrphanedBuiltin),
-      updateOutcome: p.updateState?.outcome ?? null,
-    })),
+    probes,
+    summary,
   };
 }
 
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
 
-  let latest: RuntimeSnapshot | null = null;
+  let latest: HomelabSnapshot | null = null;
   let refreshing = false;
 
   async function refresh() {
     if (refreshing) return;
     refreshing = true;
     try {
-      latest = await buildSnapshot(bb);
+      latest = await buildSnapshot();
       bb.realtime.publish(REALTIME_CHANNEL, { generatedAt: latest.generatedAt });
     } catch (err) {
       bb.log.error(`snapshot refresh failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -192,11 +158,10 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     getSnapshot: async () => {
       if (!latest) await refresh();
-      return { snapshot: latest as RuntimeSnapshot };
+      return { snapshot: latest as HomelabSnapshot };
     },
   });
 
-  // Poll on an interval; abort promptly on reload so the service stops cleanly.
   bb.background.service("snapshot-poller", {
     async start(signal) {
       await refresh();
@@ -218,44 +183,27 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  // React to live entity changes: when a thread, project, host, or the system
-  // changes, refresh immediately so the dashboard stays current between polls.
-  const unsubscribers: Array<() => void> = [];
-  const subscribeSafe = (name: string, fn: () => void) => {
-    try {
-      const rt = (bb.sdk as SdkWithRealtime).realtime;
-      if (!rt) return;
-      const unsub = rt.subscribe({ event: name, callback: fn });
-      if (typeof unsub === "function") unsubscribers.push(unsub);
-    } catch {
-      // Not all bb versions expose sdk.realtime; polling still covers us.
-    }
-  };
-  subscribeSafe("thread:changed", () => void refresh());
-  subscribeSafe("project:changed", () => void refresh());
-  subscribeSafe("host:changed", () => void refresh());
-  subscribeSafe("system:changed", () => void refresh());
-
-  // Agent/terminal-facing command: dump a compact, machine-friendly view of
-  // the live runtime state. Exercises the same snapshot builder the UI uses.
+  // Agent/terminal-facing command: dump the live homelab probe results.
   bb.cli.register({
     name: "homepage-dashboard",
-    summary: "Show live runtime state of the bb instance",
+    summary: "Show live homelab runtime state (probed endpoints)",
     commands: [
       {
         name: "snapshot",
-        summary: "Print a compact runtime snapshot",
+        summary: "Print a compact live-state snapshot of the homelab",
         usage: "bb homepage-dashboard snapshot",
       },
     ],
-    async run(_argv, ctx) {
-      const snap = await buildSnapshot(bb);
+    async run(_argv, _ctx) {
+      const snap = await buildSnapshot();
       const lines: string[] = [];
-      lines.push(`bb version: ${snap.server.version}${snap.server.hasAttention ? " (attention)" : ""}`);
-      lines.push(`projects: ${snap.projects.length}  threads: ${snap.threads.total} (active ${snap.threads.active}, idle ${snap.threads.idle}, error ${snap.threads.error})`);
-      lines.push(`hosts: ${snap.hosts.length} (${snap.hosts.filter((h) => h.status === "connected").length} connected)  providers: ${snap.providers.length}  plugins: ${snap.plugins.length}`);
-      lines.push("plugins:");
-      for (const p of snap.plugins) lines.push(`  - ${p.id} v${p.version} [${p.source.startsWith("builtin") ? "builtin" : p.provenance}]`);
+      const ts = new Date(snap.generatedAt).toLocaleTimeString();
+      lines.push(`homelab live state @ ${ts}  (${snap.summary.up}/${snap.summary.total} up)`);
+      for (const p of snap.probes) {
+        const mark = p.status === "up" ? "UP  " : p.status === "timeout" ? "TIME" : p.status === "unverified" ? "??  " : "DOWN";
+        const lat = p.latencyMs != null ? `${p.latencyMs}ms` : "—";
+        lines.push(`  [${mark}] ${p.name.padEnd(18)} ${p.host.padEnd(18)} ${lat}  ${p.detail ?? ""}`.trimEnd());
+      }
       if (snap.errors.length > 0) {
         lines.push("errors:");
         for (const e of snap.errors) lines.push(`  ! ${e}`);
@@ -265,13 +213,6 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.onDispose(() => {
-    for (const unsub of unsubscribers) {
-      try {
-        unsub();
-      } catch {
-        /* ignore */
-      }
-    }
     bb.log.info("disposed");
   });
 }
