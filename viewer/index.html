@@ -40,6 +40,28 @@
   .err { background: #2a1416; border: 1px solid #5b2126; color: #fca5a5; padding: 12px 14px; border-radius: 10px; margin-bottom: 12px; }
   .foot { color: #5b6678; font-size: 11px; margin-top: 16px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .kpi.k { cursor: pointer; text-align: left; width: 100%; font: inherit; color: inherit; transition: border-color .12s, background .12s; }
+  .kpi.k:hover { border-color: #37455c; }
+  .kpi.k.on { border-color: #6b7a92; box-shadow: 0 0 0 1px rgba(148,163,184,.25) inset; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 16px; }
+  .controls input[type=text] { flex: 1 1 160px; min-width: 160px; height: 32px; background: #0e1522; border: 1px solid #1f2937; border-radius: 8px; color: #e5e9f0; padding: 0 10px; outline: none; }
+  .controls input[type=text]:focus { border-color: #37455c; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid transparent; background: #1a2331; color: #cdd5e2; border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 600; cursor: pointer; }
+  .chip:hover { background: #222d3f; }
+  .chip.on { border-color: #6b7a92; background: #26303f; }
+  .chip .cd { width: 6px; height: 6px; border-radius: 999px; }
+  .chip .cn { color: #8b95a7; font-variant-numeric: tabular-nums; }
+  .toggle { display: inline-flex; align-items: center; gap: 6px; color: #8b95a7; font-size: 12px; cursor: pointer; }
+  .row.clic { cursor: pointer; }
+  .row.clic:hover { background: #161d2b; }
+  .caret { color: #5b6678; display: inline-block; width: 12px; transition: transform .12s; }
+  .caret.open { transform: rotate(90deg); }
+  .detail { padding: 4px 14px 12px 30px; border-bottom: 1px solid #161d2b; background: #0f1622; color: #8b95a7; font-size: 12px; }
+  .detail:last-child { border-bottom: 0; }
+  .detail .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 6px 14px; margin: 8px 0; }
+  .detail .g .gl { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: #5b6678; }
+  .detail a.open { color: #93c5fd; text-decoration: none; font-size: 12px; }
+  .empty { background: #131a26; border: 1px solid #1f2937; border-radius: 12px; padding: 24px; text-align: center; color: #8b95a7; }
 </style>
 </head>
 <body>
@@ -52,6 +74,7 @@
     <div class="sub" id="refresh">auto-refresh 15s</div>
   </header>
   <div class="kpis" id="kpis"></div>
+  <div class="controls" id="controls"></div>
   <div id="content"></div>
   <div class="foot">
     Green = answered its health route · violet = public edge live behind Cloudflare Access · red = no answer on a public route. Real probes from the bb server, not source claims.
@@ -62,52 +85,106 @@
 const KIND = { app: "App", service: "Service", infra: "Infra", remote: "Remote" };
 const TONE = { up: "ok", gated: "accent", timeout: "warn", down: "bad", inventory: "muted" };
 const REACH = { public: "public", protected: "access-gated", private: "private", none: "not-exposed", retired: "retired" };
+const REACH_DESC = {
+  public: "Unauthenticated health route the bb server can reach — a 2xx is real proof.",
+  protected: "Public hostname behind Cloudflare Access — probed for reachability; an auth wall means the ingress is live.",
+  private: "Twingate-internal .iris.sys route — not reachable from the bb server's vantage, listed as inventory.",
+  none: "Source-owned / not-exposed — no ingress to probe.",
+  retired: "Tombstoned / provenance — kept so the estate is complete.",
+};
+const DOTC = { ok: "#34d399", bad: "#f87171", warn: "#fbbf24", accent: "#c4b5fd", muted: "transparent" };
+const FILTERS = [
+  ["all", "All", "muted", () => true],
+  ["live", "Live", "ok", p => p.status === "up" || p.status === "gated"],
+  ["down", "Down", "bad", p => p.status === "down"],
+  ["timeout", "Timeout", "warn", p => p.status === "timeout"],
+  ["inventory", "Inventory", "muted", p => p.status === "inventory"],
+];
+const SECTIONS = [
+  ["Core services", p => p.reach !== "retired" && p.kind === "service"],
+  ["Apps", p => p.reach !== "retired" && p.kind === "app"],
+  ["Remote nodes", p => p.reach !== "retired" && p.kind === "remote"],
+  ["Infrastructure", p => p.reach !== "retired" && p.kind === "infra"],
+  ["Retired / provenance", p => p.reach === "retired"],
+];
+
+const UI = { query: "", filter: "all", hideRetired: false, expanded: new Set() };
+let LAST = null;
+let built = false;
 
 function esc(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
-function pill(tone, label) {
-  return `<span class="pill ${tone}">${esc(label)}</span>`;
-}
-function statusPill(p) {
-  return pill(TONE[p.status] || "muted", p.status);
+function pill(tone, label) { return `<span class="pill ${tone}">${esc(label)}</span>`; }
+function statusPill(p) { return pill(TONE[p.status] || "muted", p.status); }
+function g(l, v) { return `<div class="g"><div class="gl">${esc(l)}</div><div>${esc(v)}</div></div>`; }
+
+// Interactive state setters — re-render from the cached snapshot, no refetch.
+function setFilter(k) { UI.filter = k; renderAll(); }
+function setQuery(v) { UI.query = v; renderAll(); }
+function setHideRetired(b) { UI.hideRetired = b; renderAll(); }
+function toggleRow(id) { UI.expanded.has(id) ? UI.expanded.delete(id) : UI.expanded.add(id); renderAll(); }
+function clearFilters() { UI.query = ""; UI.filter = "all"; renderAll(); }
+
+function buildControls() {
+  const c = document.getElementById("controls");
+  c.innerHTML =
+    `<input type="text" id="search" placeholder="Search name, host, url…" />` +
+    `<span id="chips" style="display:inline-flex;gap:8px;flex-wrap:wrap"></span>` +
+    `<label class="toggle"><input type="checkbox" id="hret" /> Hide retired</label>`;
+  document.getElementById("search").addEventListener("input", e => setQuery(e.target.value));
+  document.getElementById("hret").addEventListener("change", e => setHideRetired(e.target.checked));
+  // Delegated row-expand clicks survive innerHTML swaps of #content.
+  document.getElementById("content").addEventListener("click", e => {
+    if (e.target.closest("a")) return;
+    const row = e.target.closest("[data-id]");
+    if (row) toggleRow(row.getAttribute("data-id"));
+  });
+  built = true;
 }
 
-function render(snap) {
-  const s = snap.summary || {};
-  document.getElementById("ts").textContent =
-    "updated " + new Date(snap.generatedAt).toLocaleTimeString();
-  const reach = s.reach || {};
-  const kpis = [
-    ["Estate", `${s.total ?? 0}`, `${s.active ?? 0} active`],
-    ["Live", `${(s.up ?? 0) + (s.gated ?? 0)}/${s.probed ?? 0}`, "probed reachable"],
-    ["Down", `${s.down ?? 0}`, s.down ? "needs attention" : "none"],
-    ["Timeout", `${s.timeout ?? 0}`, ""],
-    ["Inventory", `${s.inventory ?? 0}`, `${reach.private ?? 0} priv · ${reach.none ?? 0} src`],
-    ["Slowest", `${snap.slowestMs ?? 0}ms`, ""],
+function renderAll() {
+  if (!LAST) return;
+  const snap = LAST, s = snap.summary || {}, reach = s.reach || {};
+  document.getElementById("ts").textContent = "updated " + new Date(snap.generatedAt).toLocaleTimeString();
+  if (!built) buildControls();
+
+  const kpiDefs = [
+    ["all", "Estate", `${s.total ?? 0}`, `${s.active ?? 0} active`],
+    ["live", "Live", `${(s.up ?? 0) + (s.gated ?? 0)}/${s.probed ?? 0}`, "probed reachable"],
+    ["down", "Down", `${s.down ?? 0}`, s.down ? "needs attention" : "none"],
+    ["timeout", "Timeout", `${s.timeout ?? 0}`, ""],
+    ["inventory", "Inventory", `${s.inventory ?? 0}`, `${reach.private ?? 0} priv · ${reach.none ?? 0} src`],
+    [null, "Slowest", `${snap.slowestMs ?? 0}ms`, ""],
   ];
-  document.getElementById("kpis").innerHTML = kpis.map(([l, v, sub]) =>
-    `<div class="kpi"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div>${sub ? `<div class="s">${esc(sub)}</div>` : ""}</div>`
-  ).join("");
-
-  if (snap.errors && snap.errors.length) {
-    document.getElementById("content").innerHTML =
-      `<div class="err">${snap.errors.map(e => "⚠ " + esc(e)).join("<br>")}</div>` +
-      document.getElementById("content").innerHTML;
-  }
+  document.getElementById("kpis").innerHTML = kpiDefs.map(([fk, l, v, sub]) => {
+    const cls = "kpi" + (fk ? " k" : "") + (fk && UI.filter === fk ? " on" : "");
+    const click = fk ? ` onclick="setFilter('${fk}')"` : "";
+    return `<div class="${cls}"${click}><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div>${sub ? `<div class="s">${esc(sub)}</div>` : ""}</div>`;
+  }).join("");
 
   const probes = snap.probes || [];
-  const SECTIONS = [
-    ["Core services", p => p.reach !== "retired" && p.kind === "service"],
-    ["Apps", p => p.reach !== "retired" && p.kind === "app"],
-    ["Remote nodes", p => p.reach !== "retired" && p.kind === "remote"],
-    ["Infrastructure", p => p.reach !== "retired" && p.kind === "infra"],
-    ["Retired / provenance", p => p.reach === "retired"],
-  ];
-  document.getElementById("content").innerHTML = SECTIONS.map(([title, match]) => {
-    const items = probes.filter(match);
+  const pool = UI.hideRetired ? probes.filter(p => p.reach !== "retired") : probes;
+  document.getElementById("chips").innerHTML = FILTERS.map(([k, label, tone]) => {
+    const n = pool.filter(FILTERS.find(f => f[0] === k)[3]).length;
+    const dot = tone !== "muted" ? `<span class="cd" style="background:${DOTC[tone]}"></span>` : "";
+    return `<button class="chip${UI.filter === k ? " on" : ""}" onclick="setFilter('${k}')">${dot}<span>${label}</span><span class="cn">${n}</span></button>`;
+  }).join("");
+  const si = document.getElementById("search"); if (si.value !== UI.query) si.value = UI.query;
+  document.getElementById("hret").checked = UI.hideRetired;
+
+  const q = UI.query.trim().toLowerCase();
+  const fmatch = (FILTERS.find(f => f[0] === UI.filter) || FILTERS[0])[3];
+  const filtered = pool.filter(p =>
+    fmatch(p) && (!q || `${p.name} ${p.host} ${p.portfolio} ${p.url || ""}`.toLowerCase().includes(q)));
+
+  const errBlock = (snap.errors && snap.errors.length)
+    ? `<div class="err">${snap.errors.map(e => "⚠ " + esc(e)).join("<br>")}</div>` : "";
+
+  const body = SECTIONS.map(([title, match]) => {
+    const items = filtered.filter(match);
     if (!items.length) return "";
     const probed = items.filter(i => i.status !== "inventory");
     const bad = probed.filter(i => i.status === "down" || i.status === "timeout").length;
@@ -117,22 +194,44 @@ function render(snap) {
     return `<div class="card"><div class="ch"><div class="t">${esc(title)}</div>${pill(tone, label)}</div>` +
       items.map(p => {
         const dim = p.reach === "retired" || p.status === "inventory";
+        const open = UI.expanded.has(p.id);
         const badges = (p.portfolio && p.portfolio !== "active" ? ` <span class="priv">${esc(p.portfolio)}</span>` : "")
           + (p.reach !== "public" ? ` <span class="priv">${esc(REACH[p.reach] || p.reach)}</span>` : "");
-        return `
-        <div class="row"${dim ? ' style="opacity:.7"' : ""}>
-          <div style="min-width:0">
-            <div class="name">${esc(p.name)}
-              <span class="meta"> · ${esc(KIND[p.kind] || p.kind)} · ${esc(p.host)}</span>${badges}</div>
-            <div class="url">${esc(p.url || p.note)}</div>
+        let html = `
+        <div class="row clic" data-id="${esc(p.id)}"${dim ? ' style="opacity:.7"' : ""}>
+          <div style="min-width:0;display:flex;align-items:center;gap:6px">
+            <span class="caret${open ? " open" : ""}">›</span>
+            <div style="min-width:0">
+              <div class="name">${esc(p.name)}
+                <span class="meta"> · ${esc(KIND[p.kind] || p.kind)} · ${esc(p.host)}</span>${badges}</div>
+              <div class="url">${esc(p.url || p.note)}</div>
+            </div>
           </div>
           <div class="right">
             <span class="lat">${p.latencyMs != null ? esc(p.latencyMs) + "ms" : "—"}</span>
             ${statusPill(p)}
           </div>
         </div>`;
+        if (open) {
+          html += `<div class="detail">
+            <div>${esc(p.note)}</div>
+            <div class="grid">
+              ${g("Status", p.status)}${g("Reach", REACH[p.reach] || p.reach)}${g("Portfolio", p.portfolio)}
+              ${g("HTTP", p.httpStatus != null ? p.httpStatus : "—")}${g("Latency", p.latencyMs != null ? p.latencyMs + "ms" : "—")}
+            </div>
+            ${p.detail ? `<div>↳ ${esc(p.detail)}</div>` : ""}
+            <div style="margin-top:4px">${esc(REACH_DESC[p.reach] || "")}</div>
+            ${p.url ? `<div style="margin-top:6px"><a class="open" href="${esc(p.url)}" target="_blank" rel="noopener">Open ↗</a></div>` : ""}
+          </div>`;
+        }
+        return html;
       }).join("") + `</div>`;
   }).join("");
+
+  const empty = body
+    ? ""
+    : `<div class="empty">No entries match ${q ? `"${esc(UI.query)}"` : "this filter"}. <a href="#" onclick="clearFilters();return false" style="color:#93c5fd">Clear</a></div>`;
+  document.getElementById("content").innerHTML = errBlock + (body || empty);
 
   document.getElementById("privnote").textContent = s.inventory
     ? ` ${s.inventory} inventory rows (private Twingate, source-owned/not-exposed, retired) are unreachable from this vantage — a portfolio fact, not an outage.` : "";
@@ -144,13 +243,14 @@ async function load() {
     const snap = await res.json();
     if (snap.error) {
       document.getElementById("content").innerHTML =
-        `<div class="err">probe bridge error: ${snap.error}</div>`;
+        `<div class="err">probe bridge error: ${esc(snap.error)}</div>`;
       return;
     }
-    render(snap);
+    LAST = snap;
+    renderAll();
   } catch (e) {
     document.getElementById("content").innerHTML =
-      `<div class="err">failed to load: ${e}</div>`;
+      `<div class="err">failed to load: ${esc(e)}</div>`;
   }
 }
 load();

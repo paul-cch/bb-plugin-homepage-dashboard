@@ -29,6 +29,13 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({ snapshot: z.unknown() }),
   },
+  // On-demand re-probe of a single target, for the dashboard's "recheck"
+  // action. Returns the fresh result and the recomputed snapshot so the UI
+  // (and any other open surface, via realtime) converges immediately.
+  probeTarget: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ result: z.unknown(), snapshot: z.unknown() }),
+  },
 });
 
 interface FetchLike {
@@ -126,6 +133,37 @@ function inventoryReason(t: ProbeTarget): string {
   }
 }
 
+// Roll up counts from a set of probe results. Shared by the full-batch build
+// and the single-target recheck so both stay consistent.
+function summarize(probes: ProbeResult[]): HomelabSnapshot["summary"] {
+  const count = (pred: (p: ProbeResult) => boolean) => probes.filter(pred).length;
+  return {
+    total: probes.length,
+    probed: count((p) => p.status !== "inventory"),
+    up: count((p) => p.status === "up"),
+    gated: count((p) => p.status === "gated"),
+    down: count((p) => p.status === "down"),
+    timeout: count((p) => p.status === "timeout"),
+    inventory: count((p) => p.status === "inventory"),
+    reach: {
+      public: count((p) => p.reach === "public"),
+      protected: count((p) => p.reach === "protected"),
+      private: count((p) => p.reach === "private"),
+      none: count((p) => p.reach === "none"),
+      retired: count((p) => p.reach === "retired"),
+    },
+    active: count((p) => p.portfolio === "active"),
+  };
+}
+
+// Probe a single target the same way buildSnapshot does, honoring the fetch
+// availability and reach rules.
+async function probeTargetById(target: ProbeTarget): Promise<ProbeResult> {
+  const fetchFn = getFetch();
+  if (!fetchFn) return inventoryResult(target, "probe engine unavailable");
+  return isProbeable(target) ? probeOne(target, fetchFn) : inventoryResult(target, inventoryReason(target));
+}
+
 async function buildSnapshot(): Promise<HomelabSnapshot> {
   const errors: string[] = [];
   const fetchFn = getFetch();
@@ -146,24 +184,6 @@ async function buildSnapshot(): Promise<HomelabSnapshot> {
     );
   }
 
-  const count = (pred: (p: ProbeResult) => boolean) => probes.filter(pred).length;
-  const summary = {
-    total: probes.length,
-    probed: count((p) => p.status !== "inventory"),
-    up: count((p) => p.status === "up"),
-    gated: count((p) => p.status === "gated"),
-    down: count((p) => p.status === "down"),
-    timeout: count((p) => p.status === "timeout"),
-    inventory: count((p) => p.status === "inventory"),
-    reach: {
-      public: count((p) => p.reach === "public"),
-      protected: count((p) => p.reach === "protected"),
-      private: count((p) => p.reach === "private"),
-      none: count((p) => p.reach === "none"),
-      retired: count((p) => p.reach === "retired"),
-    },
-    active: count((p) => p.portfolio === "active"),
-  };
   const slowestMs = probes.reduce((max, p) => Math.max(max, p.latencyMs ?? 0), 0);
 
   return {
@@ -171,7 +191,7 @@ async function buildSnapshot(): Promise<HomelabSnapshot> {
     slowestMs,
     errors,
     probes,
-    summary,
+    summary: summarize(probes),
   };
 }
 
@@ -198,6 +218,26 @@ export default async function plugin(bb: BbPluginApi) {
     getSnapshot: async () => {
       if (!latest) await refresh();
       return { snapshot: latest as HomelabSnapshot };
+    },
+    probeTarget: async ({ id }) => {
+      const target = HOMELAB_TARGETS.find((t) => t.id === id);
+      if (!target) throw new Error(`unknown target: ${id}`);
+      const result = await probeTargetById(target);
+      if (!latest) await refresh();
+      // Patch the cached snapshot in place and recompute the roll-up so every
+      // surface converges without a full re-probe of the estate.
+      if (latest) {
+        const probes = latest.probes.map((p) => (p.id === id ? result : p));
+        latest = {
+          ...latest,
+          generatedAt: Date.now(),
+          slowestMs: probes.reduce((max, p) => Math.max(max, p.latencyMs ?? 0), 0),
+          probes,
+          summary: summarize(probes),
+        };
+        bb.realtime.publish(REALTIME_CHANNEL, { generatedAt: latest.generatedAt });
+      }
+      return { result, snapshot: latest as HomelabSnapshot };
     },
   });
 

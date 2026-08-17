@@ -6,8 +6,9 @@
 // The dashboard represents the FULL homelab estate: every entry from the
 // runtime truth map. Publicly reachable services are probed live over HTTP
 // from the bb server; private / source-owned / retired entries are shown as
-// honest inventory with their portfolio status. It keeps live via the plugin's
-// realtime signal plus a refetch on realtime reconnection.
+// honest inventory with their portfolio status. It is interactive — search,
+// filter, expand a row for detail, and re-check a single service on demand —
+// and stays live via the plugin's realtime signal plus a refetch on reconnect.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
@@ -71,7 +72,34 @@ const REACH_LABEL: Record<ProbeReach, string> = {
   retired: "retired",
 };
 
-function Kpi({ label, value, sub, tone }: { label: string; value: string | number; sub?: string; tone?: Tone }) {
+const REACH_DESC: Record<ProbeReach, string> = {
+  public: "Unauthenticated health route the bb server can reach — a 2xx is real proof.",
+  protected: "Public hostname behind Cloudflare Access — probed for reachability; an auth wall means the ingress is live.",
+  private: "Twingate-internal .iris.sys route — not reachable from the bb server's vantage, listed as inventory.",
+  none: "Source-owned / not-exposed — no ingress to probe.",
+  retired: "Tombstoned / provenance — kept so the estate is complete.",
+};
+
+// A row can be re-checked on demand only when there is an actual route to hit.
+function canRecheck(p: ProbeResult): boolean {
+  return p.url != null && (p.reach === "public" || p.reach === "protected");
+}
+
+function Kpi({
+  label,
+  value,
+  sub,
+  tone,
+  active,
+  onClick,
+}: {
+  label: string;
+  value: string | number;
+  sub?: string;
+  tone?: Tone;
+  active?: boolean;
+  onClick?: () => void;
+}) {
   const valueCls =
     tone === "bad"
       ? "text-red-600 dark:text-red-400"
@@ -80,12 +108,20 @@ function Kpi({ label, value, sub, tone }: { label: string; value: string | numbe
         : tone === "ok"
           ? "text-emerald-600 dark:text-emerald-400"
           : "";
+  const interactive = onClick != null;
   return (
-    <div className="rounded-lg border bg-card p-3">
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={!interactive}
+      className={`rounded-lg border bg-card p-3 text-left transition ${
+        interactive ? "cursor-pointer hover:border-foreground/30 hover:bg-accent/40" : "cursor-default"
+      } ${active ? "border-foreground/50 ring-1 ring-foreground/20" : ""}`}
+    >
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className={`mt-0.5 text-2xl font-semibold tabular-nums ${valueCls}`}>{value}</div>
       {sub ? <div className="mt-0.5 text-xs text-muted-foreground">{sub}</div> : null}
-    </div>
+    </button>
   );
 }
 
@@ -113,6 +149,15 @@ function useSnapshot() {
     }
   }, [rpc]);
 
+  // Re-probe a single target and adopt the server's freshly patched snapshot.
+  const recheck = useCallback(
+    async (id: string) => {
+      const { snapshot: snap } = await rpc.call("probeTarget", { id });
+      setSnapshot((snap as HomelabSnapshot | null) ?? null);
+    },
+    [rpc],
+  );
+
   useEffect(() => {
     void load();
   }, [load]);
@@ -124,7 +169,7 @@ function useSnapshot() {
     wasConnected.current = conn;
   }, [conn, load]);
 
-  return { snapshot, loading, error, reload: load };
+  return { snapshot, loading, error, reload: load, recheck };
 }
 
 // Group the estate into meaningful sections, preserving a stable order.
@@ -149,30 +194,157 @@ const KIND_LABEL: Record<ProbeKind, string> = {
   remote: "Remote",
 };
 
-function ProbeRow({ p }: { p: ProbeResult }) {
+// Which status filters are offered, and how each maps onto a probe.
+type StatusFilter = "all" | "live" | "down" | "timeout" | "inventory";
+const STATUS_FILTERS: Array<{ key: StatusFilter; label: string; tone: Tone; match: (p: ProbeResult) => boolean }> = [
+  { key: "all", label: "All", tone: "muted", match: () => true },
+  { key: "live", label: "Live", tone: "ok", match: (p) => p.status === "up" || p.status === "gated" },
+  { key: "down", label: "Down", tone: "bad", match: (p) => p.status === "down" },
+  { key: "timeout", label: "Timeout", tone: "warn", match: (p) => p.status === "timeout" },
+  { key: "inventory", label: "Inventory", tone: "muted", match: (p) => p.status === "inventory" },
+];
+
+function FilterChip({
+  active,
+  label,
+  count,
+  tone,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  count: number;
+  tone: Tone;
+  onClick: () => void;
+}) {
+  const dotCls =
+    tone === "ok"
+      ? "bg-emerald-500"
+      : tone === "bad"
+        ? "bg-red-500"
+        : tone === "warn"
+          ? "bg-amber-500"
+          : tone === "accent"
+            ? "bg-violet-500"
+            : "bg-muted-foreground/50";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition ${
+        active ? "border-foreground/40 bg-accent" : "border-transparent bg-muted hover:bg-accent/60"
+      }`}
+    >
+      {tone !== "muted" ? <span className={`h-1.5 w-1.5 rounded-full ${dotCls}`} /> : null}
+      <span>{label}</span>
+      <span className="tabular-nums text-muted-foreground">{count}</span>
+    </button>
+  );
+}
+
+function ProbeRow({
+  p,
+  expanded,
+  onToggle,
+  onRecheck,
+  rechecking,
+}: {
+  p: ProbeResult;
+  expanded: boolean;
+  onToggle: () => void;
+  onRecheck: () => void;
+  rechecking: boolean;
+}) {
   const dim = p.reach === "retired" || p.status === "inventory";
   return (
-    <div className={`flex items-center justify-between gap-2 py-1.5 ${dim ? "opacity-70" : ""}`}>
-      <div className="min-w-0">
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <span className="truncate font-medium">{p.name}</span>
-          <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{KIND_LABEL[p.kind]}</span>
-          <span className="text-[10px] text-muted-foreground">· {p.host}</span>
-          {p.portfolio !== "active" ? (
-            <span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">{p.portfolio}</span>
-          ) : null}
-          {p.reach !== "public" ? (
-            <span className="rounded bg-violet-500/10 px-1 text-[10px] font-medium text-violet-600 dark:text-violet-400">
-              {REACH_LABEL[p.reach]}
-            </span>
-          ) : null}
+    <div className={dim ? "opacity-70" : ""}>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center justify-between gap-2 py-1.5 text-left hover:bg-accent/30"
+      >
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className={`shrink-0 text-muted-foreground transition-transform ${expanded ? "rotate-90" : ""}`}>›</span>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="truncate font-medium">{p.name}</span>
+              <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{KIND_LABEL[p.kind]}</span>
+              <span className="text-[10px] text-muted-foreground">· {p.host}</span>
+              {p.portfolio !== "active" ? (
+                <span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">{p.portfolio}</span>
+              ) : null}
+              {p.reach !== "public" ? (
+                <span className="rounded bg-violet-500/10 px-1 text-[10px] font-medium text-violet-600 dark:text-violet-400">
+                  {REACH_LABEL[p.reach]}
+                </span>
+              ) : null}
+            </div>
+            <div className="truncate text-xs text-muted-foreground">{p.url ?? p.note}</div>
+          </div>
         </div>
-        <div className="truncate text-xs text-muted-foreground">{p.url ?? p.note}</div>
-      </div>
-      <div className="flex shrink-0 items-center gap-2">
-        {p.latencyMs != null ? <span className="tabular-nums text-xs text-muted-foreground">{p.latencyMs}ms</span> : null}
-        <StatusPill tone={probeTone(p.status)} label={STATUS_LABEL[p.status]} />
-      </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {p.latencyMs != null ? (
+            <span className="tabular-nums text-xs text-muted-foreground">{p.latencyMs}ms</span>
+          ) : null}
+          <StatusPill tone={probeTone(p.status)} label={rechecking ? "checking…" : STATUS_LABEL[p.status]} />
+        </div>
+      </button>
+
+      {expanded ? (
+        <div className="mb-1 ml-5 space-y-2 rounded-md bg-muted/40 p-3 text-xs">
+          <p className="text-muted-foreground">{p.note}</p>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3">
+            <Detail label="Status" value={STATUS_LABEL[p.status]} />
+            <Detail label="Reach" value={REACH_LABEL[p.reach]} />
+            <Detail label="Portfolio" value={p.portfolio} />
+            <Detail label="Host" value={p.host} />
+            <Detail label="HTTP" value={p.httpStatus != null ? String(p.httpStatus) : "—"} />
+            <Detail label="Latency" value={p.latencyMs != null ? `${p.latencyMs}ms` : "—"} />
+          </div>
+          {p.detail ? <p className="text-muted-foreground">↳ {p.detail}</p> : null}
+          <p className="text-[11px] text-muted-foreground/80">{REACH_DESC[p.reach]}</p>
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            {canRecheck(p) ? (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                disabled={rechecking}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRecheck();
+                }}
+              >
+                {rechecking ? "Rechecking…" : "Recheck now"}
+              </Button>
+            ) : (
+              <span className="text-[11px] text-muted-foreground">No live route to re-check.</span>
+            )}
+            {p.url ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2 text-xs"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  window.open(p.url as string, "_blank", "noopener,noreferrer");
+                }}
+              >
+                Open ↗
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function Detail({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground/70">{label}</div>
+      <div className="tabular-nums">{value}</div>
     </div>
   );
 }
@@ -193,9 +365,68 @@ function sectionLabel(items: ProbeResult[]): string {
 }
 
 function FullDashboard() {
-  const { snapshot, loading, error, reload } = useSnapshot();
+  const { snapshot, loading, error, reload, recheck } = useSnapshot();
 
-  const sections = useMemo(() => (snapshot ? sectionize(snapshot.probes) : []), [snapshot]);
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [hideRetired, setHideRetired] = useState(false);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const [rechecking, setRechecking] = useState<Set<string>>(() => new Set());
+
+  const toggleExpanded = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const doRecheck = useCallback(
+    async (id: string) => {
+      setRechecking((prev) => new Set(prev).add(id));
+      try {
+        await recheck(id);
+      } finally {
+        setRechecking((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    },
+    [recheck],
+  );
+
+  // The pool the filter chips count against (respects the retired toggle).
+  const pool = useMemo(() => {
+    const all = snapshot?.probes ?? [];
+    return hideRetired ? all.filter((p) => p.reach !== "retired") : all;
+  }, [snapshot, hideRetired]);
+
+  const counts = useMemo(() => {
+    const map: Record<StatusFilter, number> = { all: 0, live: 0, down: 0, timeout: 0, inventory: 0 };
+    for (const f of STATUS_FILTERS) map[f.key] = pool.filter(f.match).length;
+    return map;
+  }, [pool]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const statusMatch = STATUS_FILTERS.find((f) => f.key === statusFilter)!.match;
+    return pool.filter((p) => {
+      if (!statusMatch(p)) return false;
+      if (!q) return true;
+      return (
+        p.name.toLowerCase().includes(q) ||
+        p.host.toLowerCase().includes(q) ||
+        p.portfolio.toLowerCase().includes(q) ||
+        (p.url ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [pool, query, statusFilter]);
+
+  const sections = useMemo(() => sectionize(filtered), [filtered]);
+  const s = snapshot?.summary;
 
   return (
     <div className="p-4 md:p-5">
@@ -219,54 +450,110 @@ function FullDashboard() {
           </div>
         ) : null}
 
-        {!snapshot ? (
+        {!snapshot || !s ? (
           <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground">
             {loading ? "Probing homelab estate…" : "No snapshot available."}
           </div>
         ) : (
           <>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-              <Kpi label="Estate" value={snapshot.summary.total} sub={`${snapshot.summary.active} active`} />
+              <Kpi label="Estate" value={s.total} sub={`${s.active} active`} active={statusFilter === "all"} onClick={() => setStatusFilter("all")} />
               <Kpi
                 label="Live"
-                value={`${snapshot.summary.up + snapshot.summary.gated}/${snapshot.summary.probed}`}
+                value={`${s.up + s.gated}/${s.probed}`}
                 sub="probed reachable"
                 tone="ok"
+                active={statusFilter === "live"}
+                onClick={() => setStatusFilter("live")}
               />
               <Kpi
                 label="Down"
-                value={snapshot.summary.down}
-                sub={snapshot.summary.down ? "needs attention" : "none"}
-                tone={snapshot.summary.down ? "bad" : undefined}
+                value={s.down}
+                sub={s.down ? "needs attention" : "none"}
+                tone={s.down ? "bad" : undefined}
+                active={statusFilter === "down"}
+                onClick={() => setStatusFilter("down")}
               />
               <Kpi
                 label="Timeout"
-                value={snapshot.summary.timeout}
-                tone={snapshot.summary.timeout ? "warn" : undefined}
+                value={s.timeout}
+                tone={s.timeout ? "warn" : undefined}
+                active={statusFilter === "timeout"}
+                onClick={() => setStatusFilter("timeout")}
               />
               <Kpi
                 label="Inventory"
-                value={snapshot.summary.inventory}
-                sub={`${snapshot.summary.reach.private} priv · ${snapshot.summary.reach.none} src`}
+                value={s.inventory}
+                sub={`${s.reach.private} priv · ${s.reach.none} src`}
+                active={statusFilter === "inventory"}
+                onClick={() => setStatusFilter("inventory")}
               />
               <Kpi label="Slowest" value={`${snapshot.slowestMs}ms`} />
             </div>
 
-            {sections.map((section) => (
-              <Card key={section.key}>
-                <CardHeader>
-                  <CardTitle className="flex items-center justify-between text-base">
-                    <span>{section.title}</span>
-                    <StatusPill tone={sectionTone(section.items)} label={sectionLabel(section.items)} />
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="divide-y text-sm">
-                  {section.items.map((p) => (
-                    <ProbeRow key={p.id} p={p} />
-                  ))}
-                </CardContent>
-              </Card>
-            ))}
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search name, host, url…"
+                className="h-8 min-w-[10rem] flex-1 rounded-md border bg-background px-2.5 text-sm outline-none focus:border-foreground/40"
+              />
+              {STATUS_FILTERS.map((f) => (
+                <FilterChip
+                  key={f.key}
+                  active={statusFilter === f.key}
+                  label={f.label}
+                  count={counts[f.key]}
+                  tone={f.tone}
+                  onClick={() => setStatusFilter(f.key)}
+                />
+              ))}
+              <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+                <input type="checkbox" checked={hideRetired} onChange={(e) => setHideRetired(e.target.checked)} />
+                Hide retired
+              </label>
+            </div>
+
+            {sections.length === 0 ? (
+              <div className="rounded-lg border bg-card p-6 text-center text-sm text-muted-foreground">
+                No entries match {query ? `"${query}"` : "this filter"}.
+                <Button
+                  size="sm"
+                  variant="link"
+                  className="ml-1 px-0"
+                  onClick={() => {
+                    setQuery("");
+                    setStatusFilter("all");
+                  }}
+                >
+                  Clear
+                </Button>
+              </div>
+            ) : (
+              sections.map((section) => (
+                <Card key={section.key}>
+                  <CardHeader>
+                    <CardTitle className="flex items-center justify-between text-base">
+                      <span>{section.title}</span>
+                      <StatusPill tone={sectionTone(section.items)} label={sectionLabel(section.items)} />
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="divide-y text-sm">
+                    {section.items.map((p) => (
+                      <ProbeRow
+                        key={p.id}
+                        p={p}
+                        expanded={expanded.has(p.id)}
+                        onToggle={() => toggleExpanded(p.id)}
+                        onRecheck={() => void doRecheck(p.id)}
+                        rechecking={rechecking.has(p.id)}
+                      />
+                    ))}
+                  </CardContent>
+                </Card>
+              ))
+            )}
 
             {snapshot.errors.length > 0 ? (
               <Card>
@@ -287,10 +574,10 @@ function FullDashboard() {
               <span className="text-emerald-600 dark:text-emerald-400">Green</span> = answered its health route ·{" "}
               <span className="text-violet-600 dark:text-violet-400">gated</span> = public edge live behind Cloudflare
               Access ·{" "}
-              <span className="text-red-600 dark:text-red-400">down</span> = no answer on a public route. The{" "}
-              {snapshot.summary.inventory} inventory rows (private Twingate, source-owned/not-exposed, retired) can't be
-              probed from this vantage — that's a portfolio fact, not an outage. Live probes are independent of the
-              repo's source claims.
+              <span className="text-red-600 dark:text-red-400">down</span> = no answer on a public route. Click a row for
+              detail and to re-check a single service. The {s.inventory} inventory rows (private Twingate,
+              source-owned/not-exposed, retired) can't be probed from this vantage — that's a portfolio fact, not an
+              outage.
             </p>
           </>
         )}
