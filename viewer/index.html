@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Homelab — Live</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0b0f17; color: #e5e9f0;
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  .sub { color: #8b95a7; font-size: 12px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .kpi { background: #131a26; border: 1px solid #1f2937; border-radius: 10px; padding: 10px 12px; }
+  .kpi .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kpi .l { color: #8b95a7; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .kpi .s { color: #8b95a7; font-size: 11px; margin-top: 2px; }
+  .card { background: #131a26; border: 1px solid #1f2937; border-radius: 12px; margin-bottom: 12px; overflow: hidden; }
+  .card .ch { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #1f2937; }
+  .card .ch .t { font-weight: 600; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 14px; border-bottom: 1px solid #161d2b; }
+  .row:last-child { border-bottom: 0; }
+  .row .name { font-weight: 550; }
+  .row .meta { color: #8b95a7; font-size: 12px; }
+  .row .url { color: #5b6678; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 380px; }
+  .right { display: flex; align-items: center; gap: 10px; }
+  .pill { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 600; }
+  .ok { background: rgba(16,185,129,.16); color: #34d399; }
+  .bad { background: rgba(239,68,68,.16); color: #f87171; }
+  .warn { background: rgba(245,158,11,.16); color: #fbbf24; }
+  .muted { background: rgba(148,163,184,.14); color: #94a3b8; }
+  .lat { color: #8b95a7; font-size: 12px; font-variant-numeric: tabular-nums; min-width: 48px; text-align: right; }
+  .priv { background: rgba(167,139,250,.16); color: #c4b5fd; font-size: 10px; padding: 1px 6px; border-radius: 999px; }
+  .err { background: #2a1416; border: 1px solid #5b2126; color: #fca5a5; padding: 12px 14px; border-radius: 10px; margin-bottom: 12px; }
+  .foot { color: #5b6678; font-size: 11px; margin-top: 16px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Homelab — Live</h1>
+      <div class="sub" id="ts">probing…</div>
+    </div>
+    <div class="sub" id="refresh">auto-refresh 15s</div>
+  </header>
+  <div class="kpis" id="kpis"></div>
+  <div id="content"></div>
+  <div class="foot">
+    Green = the service answered its health route from the bb server's network (real probe, not a source claim).
+    <span id="privnote"></span>
+  </div>
+</div>
+<script>
+const KIND = { app: "App", service: "Service", infra: "Infra", remote: "Remote", operator: "Operator" };
+const TONE = { up: "ok", timeout: "warn", down: "bad", unverified: "muted" };
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function pill(tone, label) {
+  return `<span class="pill ${tone}">${esc(label)}</span>`;
+}
+function statusPill(p) {
+  if (p.reach === "twingate") return pill("muted", "private");
+  return pill(TONE[p.status] || "muted", p.status);
+}
+
+function render(snap) {
+  const s = snap.summary || {};
+  document.getElementById("ts").textContent =
+    "updated " + new Date(snap.generatedAt).toLocaleTimeString();
+  const kpis = [
+    ["Up", `${s.up ?? 0}/${s.reachable ?? 0}`, `of ${s.reachable ?? 0} reachable`],
+    ["Down", `${s.down ?? 0}`, s.down ? "needs attention" : "none"],
+    ["Timeout", `${s.timeout ?? 0}`, ""],
+    ["Slowest", `${snap.slowestMs ?? 0}ms`, ""],
+    ["Private", `${s.private ?? 0}`, "inventory only"],
+  ];
+  document.getElementById("kpis").innerHTML = kpis.map(([l, v, sub]) =>
+    `<div class="kpi"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div>${sub ? `<div class="s">${esc(sub)}</div>` : ""}</div>`
+  ).join("");
+
+  if (snap.errors && snap.errors.length) {
+    document.getElementById("content").innerHTML =
+      `<div class="err">${snap.errors.map(e => "⚠ " + esc(e)).join("<br>")}</div>` +
+      document.getElementById("content").innerHTML;
+  }
+
+  const probes = snap.probes || [];
+  const groups = {};
+  const order = [];
+  for (const p of probes) {
+    if (!(p.host in groups)) { groups[p.host] = []; order.push(p.host); }
+    groups[p.host].push(p);
+  }
+  document.getElementById("content").innerHTML = order.map(host => {
+    const items = groups[host];
+    const up = items.filter(i => i.status === "up").length;
+    const tone = up === items.length ? "ok" : up > 0 ? "warn" : "bad";
+    return `<div class="card"><div class="ch"><div class="t">${esc(host)}</div>${pill(tone, up + "/" + items.length + " up")}</div>` +
+      items.map(p => `
+        <div class="row">
+          <div style="min-width:0">
+            <div class="name">${esc(p.name)}${p.reach === "twingate" ? ' <span class="priv">private</span>' : ""}
+              <span class="meta"> · ${esc(KIND[p.kind] || p.kind)}</span></div>
+            <div class="url">${esc(p.url)}</div>
+          </div>
+          <div class="right">
+            <span class="lat">${p.latencyMs != null ? esc(p.latencyMs) + "ms" : "—"}</span>
+            ${statusPill(p)}
+          </div>
+        </div>`).join("") + `</div>`;
+  }).join("");
+
+  document.getElementById("privnote").textContent = s.private
+    ? ` ${s.private} private Twingate/not-exposed routes are inventory-only (unreachable from this vantage).` : "";
+}
+
+async function load() {
+  try {
+    const res = await fetch("/api/snapshot", { cache: "no-store" });
+    const snap = await res.json();
+    if (snap.error) {
+      document.getElementById("content").innerHTML =
+        `<div class="err">probe bridge error: ${snap.error}</div>`;
+      return;
+    }
+    render(snap);
+  } catch (e) {
+    document.getElementById("content").innerHTML =
+      `<div class="err">failed to load: ${e}</div>`;
+  }
+}
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>
