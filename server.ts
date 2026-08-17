@@ -223,8 +223,11 @@ export default async function plugin(bb: BbPluginApi) {
         usage: "bb homepage-dashboard snapshot",
       },
     ],
-    async run(_argv, _ctx) {
+    async run(argv, _ctx) {
       const snap = await buildSnapshot();
+      if (argv.includes("--json")) {
+        return { exitCode: 0, stdout: JSON.stringify(snap) };
+      }
       const lines: string[] = [];
       const ts = new Date(snap.generatedAt).toLocaleTimeString();
       const s = snap.summary;
