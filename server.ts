@@ -54,6 +54,16 @@ function asArray<T>(value: unknown): T[] {
   return Array.isArray(value) ? (value as T[]) : [];
 }
 
+// Some SDK list results arrive wrapped in an object (e.g. { plugins: [...] }).
+// Unwrap a known single-array key when the value is not itself an array.
+function unwrapKey<T>(value: unknown, key: string): T[] {
+  if (Array.isArray(value)) return value as T[];
+  if (value && typeof value === "object" && Array.isArray((value as Record<string, unknown>)[key])) {
+    return (value as Record<string, unknown>)[key] as T[];
+  }
+  return [];
+}
+
 // Optional, release-dependent SDK surface. Guard every access so the plugin
 // loads on bb versions that do not expose it.
 interface SdkWithRealtime {
@@ -74,14 +84,14 @@ async function buildSnapshot(bb: BbPluginApi): Promise<RuntimeSnapshot> {
     safe(() => sdk.threads.list({ limit: 100 }), [], errors, "threads.list"),
     safe(() => sdk.hosts.list(), [], errors, "hosts.list"),
     safe(() => sdk.providers.list(), [], errors, "providers.list"),
-    safe(() => sdk.plugins.list(), [], errors, "plugins.list"),
+    safe(() => sdk.plugins.list(), { plugins: [] }, errors, "plugins.list"),
   ]);
 
   const projects = asArray<ProjectLike>(projectsRaw);
   const threads = asArray<ThreadLike>(threadsRaw);
   const hosts = asArray<HostLike>(hostsRaw);
   const providers = asArray<ProviderLike>(providersRaw);
-  const plugins = asArray<PluginLike>(pluginsRaw);
+  const plugins = unwrapKey<PluginLike>(pluginsRaw, "plugins");
 
   // Thread aggregation.
   let active = 0;
@@ -120,7 +130,7 @@ async function buildSnapshot(bb: BbPluginApi): Promise<RuntimeSnapshot> {
     generatedAt: Date.now(),
     errors,
     server: {
-      version: (serverVersion as { version?: string })?.version ?? "unknown",
+      version: (serverVersion as { currentVersion?: string })?.currentVersion ?? "unknown",
       hasAttention: (attention as { hasAttention?: boolean })?.hasAttention ?? false,
     },
     projects: projects.map((p) => ({
