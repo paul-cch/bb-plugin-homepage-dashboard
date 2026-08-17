@@ -118,6 +118,9 @@ function ProbeRow({ p }: { p: ProbeResult }) {
         <div className="flex items-center gap-2">
           <span className="truncate font-medium">{p.name}</span>
           <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{KIND_LABEL[p.kind]}</span>
+          {p.reach === "twingate" ? (
+            <span className="rounded bg-violet-500/15 px-1 text-[10px] font-medium text-violet-600 dark:text-violet-400">private</span>
+          ) : null}
         </div>
         <div className="truncate text-xs text-muted-foreground">{p.url}</div>
       </div>
@@ -166,7 +169,7 @@ function FullDashboard() {
         ) : (
           <>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Kpi label="Services up" value={`${snapshot.summary.up}/${snapshot.summary.total}`} sub="probed live" />
+              <Kpi label="Services up" value={`${snapshot.summary.up}/${snapshot.summary.reachable}`} sub={`of ${snapshot.summary.reachable} reachable`} />
               <Kpi label="Down" value={snapshot.summary.down} sub={snapshot.summary.down ? "needs attention" : "none"} />
               <Kpi label="Timeout" value={snapshot.summary.timeout} />
               <Kpi label="Slowest" value={`${snapshot.slowestMs}ms`} />
@@ -210,8 +213,10 @@ function FullDashboard() {
             ) : null}
 
             <p className="text-xs text-muted-foreground">
-              Green = the service answered its health route from the bb server's network. These are
-              live reachability probes, independent of the repo's source claims.
+              Green = the service answered its health route from the bb server's network. {snapshot.summary.private > 0
+                ? `${snapshot.summary.private} private Twingate/not-exposed routes are listed as inventory only — they can't be probed from this vantage. `
+                : ""}
+              These are live reachability probes, independent of the repo's source claims.
             </p>
           </>
         )}
@@ -239,13 +244,17 @@ function HomepageSection() {
         ) : (
           <>
             <div className="grid grid-cols-3 gap-2">
-              <Kpi label="Up" value={`${snapshot.summary.up}/${snapshot.summary.total}`} />
+              <Kpi label="Up" value={`${snapshot.summary.up}/${snapshot.summary.reachable}`} />
               <Kpi label="Down" value={snapshot.summary.down} />
               <Kpi label="Slowest" value={`${snapshot.slowestMs}ms`} />
             </div>
             <div className="flex flex-wrap items-center gap-2 text-xs">
               {snapshot.probes.slice(0, 8).map((p) => (
-                <StatusPill key={p.id} tone={probeTone(p.status)} label={p.name} />
+                <StatusPill
+                  key={p.id}
+                  tone={p.reach === "twingate" ? "muted" : probeTone(p.status)}
+                  label={p.reach === "twingate" ? `${p.name} · private` : p.name}
+                />
               ))}
               {snapshot.probes.length > 8 ? (
                 <StatusPill tone="muted" label={`+${snapshot.probes.length - 8} more`} />

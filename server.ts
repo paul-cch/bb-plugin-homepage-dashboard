@@ -70,6 +70,7 @@ async function probeOne(
       host: target.host,
       url: target.url,
       note: target.note,
+      reach: target.reach,
       status,
       httpStatus,
       latencyMs,
@@ -86,6 +87,7 @@ async function probeOne(
       host: target.host,
       url: target.url,
       note: target.note,
+      reach: target.reach,
       status,
       httpStatus: null,
       latencyMs: aborted ? PROBE_TIMEOUT_MS : latencyMs,
@@ -108,6 +110,7 @@ async function buildSnapshot(): Promise<HomelabSnapshot> {
       host: t.host,
       url: t.url,
       note: t.note,
+      reach: t.reach,
       status: "unverified" as ProbeStatus,
       httpStatus: null,
       latencyMs: null,
@@ -115,7 +118,29 @@ async function buildSnapshot(): Promise<HomelabSnapshot> {
     }));
   } else {
     // Fan out all probes concurrently; one failure never blocks the others.
-    probes = await Promise.all(HOMELAB_TARGETS.map((t) => probeOne(t, fetchFn)));
+    // Twingate-private (.iris.sys / not-exposed) routes are unreachable from
+    // the bb server's vantage, so report them as inventory-only rather than a
+    // misleading "down" — that would be a vantage limit, not an outage.
+    probes = await Promise.all(
+      HOMELAB_TARGETS.map<Promise<ProbeResult>>(async (t) => {
+        if (t.reach === "twingate") {
+          return {
+            id: t.id,
+            name: t.name,
+            kind: t.kind,
+            host: t.host,
+            url: t.url,
+            note: t.note,
+            reach: t.reach,
+            status: "unverified",
+            httpStatus: null,
+            latencyMs: null,
+            detail: "private route — not probed from here",
+          };
+        }
+        return probeOne(t, fetchFn);
+      }),
+    );
   }
 
   const summary = {
@@ -124,6 +149,10 @@ async function buildSnapshot(): Promise<HomelabSnapshot> {
     down: probes.filter((p) => p.status === "down").length,
     timeout: probes.filter((p) => p.status === "timeout").length,
     unverified: probes.filter((p) => p.status === "unverified").length,
+    // Private routes are unreachable from the bb server, so the honest
+    // denominator for "is it up?" is the public/reachable set.
+    reachable: probes.filter((p) => p.reach === "public").length,
+    private: probes.filter((p) => p.reach === "twingate").length,
   };
   const slowestMs = probes.reduce((max, p) => Math.max(max, p.latencyMs ?? 0), 0);
 
@@ -198,9 +227,11 @@ export default async function plugin(bb: BbPluginApi) {
       const snap = await buildSnapshot();
       const lines: string[] = [];
       const ts = new Date(snap.generatedAt).toLocaleTimeString();
-      lines.push(`homelab live state @ ${ts}  (${snap.summary.up}/${snap.summary.total} up)`);
+      const s = snap.summary;
+      lines.push(`homelab live state @ ${ts}`);
+      lines.push(`  reachable: ${s.up}/${s.reachable} up · ${s.down} down · ${s.timeout} timeout · ${s.private} private (not probed from here)`);
       for (const p of snap.probes) {
-        const mark = p.status === "up" ? "UP  " : p.status === "timeout" ? "TIME" : p.status === "unverified" ? "??  " : "DOWN";
+        const mark = p.status === "up" ? "UP  " : p.status === "timeout" ? "TIME" : p.status === "unverified" ? (p.reach === "twingate" ? "PRIV" : "??  ") : "DOWN";
         const lat = p.latencyMs != null ? `${p.latencyMs}ms` : "—";
         lines.push(`  [${mark}] ${p.name.padEnd(18)} ${p.host.padEnd(18)} ${lat}  ${p.detail ?? ""}`.trimEnd());
       }

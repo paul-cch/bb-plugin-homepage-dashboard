@@ -23,6 +23,8 @@ export interface ProbeResult {
   host: string;
   url: string;
   note: string;
+  /** Whether this endpoint is reachable from the bb server's vantage. */
+  reach: "public" | "twingate";
   /** Final live status for this probe. */
   status: ProbeStatus;
   /** HTTP status code when we got an HTTP response, else null. */
@@ -49,6 +51,10 @@ export interface HomelabSnapshot {
     down: number;
     timeout: number;
     unverified: number;
+    /** Targets reachable from the bb server's vantage (public routes). */
+    reachable: number;
+    /** Targets on private Twingate/not-exposed routes (inventory only). */
+    private: number;
   };
 }
 
