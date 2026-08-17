@@ -226,6 +226,34 @@ export default async function plugin(bb: BbPluginApi) {
   subscribeSafe("host:changed", () => void refresh());
   subscribeSafe("system:changed", () => void refresh());
 
+  // Agent/terminal-facing command: dump a compact, machine-friendly view of
+  // the live runtime state. Exercises the same snapshot builder the UI uses.
+  bb.cli.register({
+    name: "homepage-dashboard",
+    summary: "Show live runtime state of the bb instance",
+    commands: [
+      {
+        name: "snapshot",
+        summary: "Print a compact runtime snapshot",
+        usage: "bb homepage-dashboard snapshot",
+      },
+    ],
+    async run(_argv, ctx) {
+      const snap = await buildSnapshot(bb);
+      const lines: string[] = [];
+      lines.push(`bb version: ${snap.server.version}${snap.server.hasAttention ? " (attention)" : ""}`);
+      lines.push(`projects: ${snap.projects.length}  threads: ${snap.threads.total} (active ${snap.threads.active}, idle ${snap.threads.idle}, error ${snap.threads.error})`);
+      lines.push(`hosts: ${snap.hosts.length} (${snap.hosts.filter((h) => h.status === "connected").length} connected)  providers: ${snap.providers.length}  plugins: ${snap.plugins.length}`);
+      lines.push("plugins:");
+      for (const p of snap.plugins) lines.push(`  - ${p.id} v${p.version} [${p.source.startsWith("builtin") ? "builtin" : p.provenance}]`);
+      if (snap.errors.length > 0) {
+        lines.push("errors:");
+        for (const e of snap.errors) lines.push(`  ! ${e}`);
+      }
+      return { exitCode: 0, stdout: lines.join("\n") };
+    },
+  });
+
   bb.onDispose(() => {
     for (const unsub of unsubscribers) {
       try {
