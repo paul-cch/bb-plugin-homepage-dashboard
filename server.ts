@@ -16,11 +16,10 @@ import { z } from "zod";
 import {
   REALTIME_CHANNEL,
   type HomelabSnapshot,
-  type ProbeKind,
   type ProbeResult,
   type ProbeStatus,
 } from "./lib/runtime";
-import { HOMELAB_TARGETS } from "./lib/homelab-endpoints";
+import { HOMELAB_TARGETS, type ProbeTarget } from "./lib/homelab-endpoints";
 
 const POLL_INTERVAL_MS = 30_000;
 const PROBE_TIMEOUT_MS = 6_000;
@@ -44,55 +43,86 @@ function getFetch(): FetchLike | null {
   return typeof g.fetch === "function" ? g.fetch : null;
 }
 
-async function probeOne(
-  target: (typeof HOMELAB_TARGETS)[number],
-  fetchFn: FetchLike,
-): Promise<ProbeResult> {
+// Carry the target's identity fields onto every result so the frontend has the
+// full estate row regardless of whether it was probed.
+function base(target: ProbeTarget): Omit<ProbeResult, "status" | "httpStatus" | "latencyMs" | "detail"> {
+  return {
+    id: target.id,
+    name: target.name,
+    kind: target.kind,
+    host: target.host,
+    portfolio: target.portfolio,
+    url: target.url,
+    note: target.note,
+    reach: target.reach,
+  };
+}
+
+// An inventory row: represented in the estate, but not probed from here.
+function inventoryResult(target: ProbeTarget, detail: string): ProbeResult {
+  return { ...base(target), status: "inventory", httpStatus: null, latencyMs: null, detail };
+}
+
+// A target is only reached out to when it carries a route and is either a real
+// public health endpoint or a public-but-auth-gated (protected) hostname.
+function isProbeable(t: ProbeTarget): boolean {
+  return t.url != null && (t.reach === "public" || t.reach === "protected");
+}
+
+async function probeOne(target: ProbeTarget, fetchFn: FetchLike): Promise<ProbeResult> {
+  const url = target.url as string; // guarded by isProbeable
   const started = Date.now();
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
     let httpStatus: number | null = null;
-    let up = false;
     try {
-      const res = await fetchFn(target.url, { signal: controller.signal });
+      const res = await fetchFn(url, { signal: controller.signal });
       httpStatus = res.status;
-      up = res.status >= 200 && res.status < 300;
     } finally {
       clearTimeout(timer);
     }
     const latencyMs = Date.now() - started;
-    const status: ProbeStatus = up ? "up" : "down";
-    return {
-      id: target.id,
-      name: target.name,
-      kind: target.kind,
-      host: target.host,
-      url: target.url,
-      note: target.note,
-      reach: target.reach,
-      status,
-      httpStatus,
-      latencyMs,
-      detail: up ? null : `HTTP ${httpStatus ?? "?"}`,
-    };
+    const code = httpStatus ?? 0;
+    const ok = code >= 200 && code < 300;
+    // A redirect or auth wall (3xx / 401 / 403) means the edge answered — the
+    // ingress/tunnel is live, just behind Cloudflare Access from this vantage.
+    // That is "gated", never a false "down". Only a hard 4xx/5xx or a
+    // connection error is a real outage signal. This is reach-independent so a
+    // documented-public route that redirects here isn't misreported.
+    const gated = !ok && (code === 401 || code === 403 || (code >= 300 && code < 400));
+    const status: ProbeStatus = ok ? "up" : gated ? "gated" : "down";
+    const detail = ok
+      ? null
+      : gated
+        ? `edge live · auth wall (HTTP ${code})`
+        : `HTTP ${httpStatus ?? "?"}`;
+    return { ...base(target), status, httpStatus, latencyMs, detail };
   } catch (err) {
     const latencyMs = Date.now() - started;
     const aborted = err instanceof Error && err.name === "AbortError";
     const status: ProbeStatus = aborted ? "timeout" : "down";
     return {
-      id: target.id,
-      name: target.name,
-      kind: target.kind,
-      host: target.host,
-      url: target.url,
-      note: target.note,
-      reach: target.reach,
+      ...base(target),
       status,
       httpStatus: null,
       latencyMs: aborted ? PROBE_TIMEOUT_MS : latencyMs,
       detail: aborted ? `timeout >${PROBE_TIMEOUT_MS}ms` : err instanceof Error ? err.message : String(err),
     };
+  }
+}
+
+// Why a target is inventory-only rather than probed, per reach class.
+function inventoryReason(t: ProbeTarget): string {
+  switch (t.reach) {
+    case "private":
+      return "private Twingate route — not probed from this vantage";
+    case "retired":
+      return "retired / provenance — no live route";
+    case "protected":
+      return "public but Access-gated; no confirmed unauth route to probe";
+    default:
+      return "source-owned / not-exposed — no ingress to probe";
   }
 }
 
@@ -103,56 +133,36 @@ async function buildSnapshot(): Promise<HomelabSnapshot> {
 
   if (!fetchFn) {
     errors.push("global fetch unavailable in this bb release — cannot probe live state");
-    probes = HOMELAB_TARGETS.map((t) => ({
-      id: t.id,
-      name: t.name,
-      kind: t.kind as ProbeKind,
-      host: t.host,
-      url: t.url,
-      note: t.note,
-      reach: t.reach,
-      status: "unverified" as ProbeStatus,
-      httpStatus: null,
-      latencyMs: null,
-      detail: "probe engine unavailable",
-    }));
+    probes = HOMELAB_TARGETS.map((t) => inventoryResult(t, "probe engine unavailable"));
   } else {
-    // Fan out all probes concurrently; one failure never blocks the others.
-    // Twingate-private (.iris.sys / not-exposed) routes are unreachable from
-    // the bb server's vantage, so report them as inventory-only rather than a
-    // misleading "down" — that would be a vantage limit, not an outage.
+    // Fan out all live probes concurrently; one failure never blocks the
+    // others. Everything else (private .iris.sys, source-owned/not-exposed,
+    // retired) is represented as honest inventory rather than a misleading
+    // "down" — a blank there is a vantage or portfolio fact, not an outage.
     probes = await Promise.all(
-      HOMELAB_TARGETS.map<Promise<ProbeResult>>(async (t) => {
-        if (t.reach === "twingate") {
-          return {
-            id: t.id,
-            name: t.name,
-            kind: t.kind,
-            host: t.host,
-            url: t.url,
-            note: t.note,
-            reach: t.reach,
-            status: "unverified",
-            httpStatus: null,
-            latencyMs: null,
-            detail: "private route — not probed from here",
-          };
-        }
-        return probeOne(t, fetchFn);
-      }),
+      HOMELAB_TARGETS.map<Promise<ProbeResult>>((t) =>
+        isProbeable(t) ? probeOne(t, fetchFn) : Promise.resolve(inventoryResult(t, inventoryReason(t))),
+      ),
     );
   }
 
+  const count = (pred: (p: ProbeResult) => boolean) => probes.filter(pred).length;
   const summary = {
     total: probes.length,
-    up: probes.filter((p) => p.status === "up").length,
-    down: probes.filter((p) => p.status === "down").length,
-    timeout: probes.filter((p) => p.status === "timeout").length,
-    unverified: probes.filter((p) => p.status === "unverified").length,
-    // Private routes are unreachable from the bb server, so the honest
-    // denominator for "is it up?" is the public/reachable set.
-    reachable: probes.filter((p) => p.reach === "public").length,
-    private: probes.filter((p) => p.reach === "twingate").length,
+    probed: count((p) => p.status !== "inventory"),
+    up: count((p) => p.status === "up"),
+    gated: count((p) => p.status === "gated"),
+    down: count((p) => p.status === "down"),
+    timeout: count((p) => p.status === "timeout"),
+    inventory: count((p) => p.status === "inventory"),
+    reach: {
+      public: count((p) => p.reach === "public"),
+      protected: count((p) => p.reach === "protected"),
+      private: count((p) => p.reach === "private"),
+      none: count((p) => p.reach === "none"),
+      retired: count((p) => p.reach === "retired"),
+    },
+    active: count((p) => p.portfolio === "active"),
   };
   const slowestMs = probes.reduce((max, p) => Math.max(max, p.latencyMs ?? 0), 0);
 
@@ -231,12 +241,28 @@ export default async function plugin(bb: BbPluginApi) {
       const lines: string[] = [];
       const ts = new Date(snap.generatedAt).toLocaleTimeString();
       const s = snap.summary;
-      lines.push(`homelab live state @ ${ts}`);
-      lines.push(`  reachable: ${s.up}/${s.reachable} up · ${s.down} down · ${s.timeout} timeout · ${s.private} private (not probed from here)`);
+      lines.push(`homelab estate @ ${ts} — ${s.total} entries (${s.active} active)`);
+      lines.push(
+        `  probed ${s.probed}: ${s.up} up · ${s.gated} gated · ${s.down} down · ${s.timeout} timeout` +
+          `  |  inventory ${s.inventory}: ${s.reach.private} private · ${s.reach.none} source-only · ${s.reach.retired} retired`,
+      );
+      const mark = (p: ProbeResult): string => {
+        switch (p.status) {
+          case "up":
+            return "UP  ";
+          case "gated":
+            return "GATE";
+          case "timeout":
+            return "TIME";
+          case "down":
+            return "DOWN";
+          default:
+            return p.reach === "private" ? "PRIV" : p.reach === "retired" ? "RETD" : "INV ";
+        }
+      };
       for (const p of snap.probes) {
-        const mark = p.status === "up" ? "UP  " : p.status === "timeout" ? "TIME" : p.status === "unverified" ? (p.reach === "twingate" ? "PRIV" : "??  ") : "DOWN";
         const lat = p.latencyMs != null ? `${p.latencyMs}ms` : "—";
-        lines.push(`  [${mark}] ${p.name.padEnd(18)} ${p.host.padEnd(18)} ${lat}  ${p.detail ?? ""}`.trimEnd());
+        lines.push(`  [${mark(p)}] ${p.name.padEnd(24)} ${p.host.padEnd(18)} ${lat.padStart(6)}  ${p.detail ?? ""}`.trimEnd());
       }
       if (snap.errors.length > 0) {
         lines.push("errors:");

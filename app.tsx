@@ -3,18 +3,28 @@
 // Compiled by `bb plugin build` into dist/app.js + dist/app.css. React and
 // @get-bb/plugin-sdk/app are provided by the BB app at load time (never bundled).
 //
-// The dashboard pulls a live homelab snapshot over RPC (real HTTP probe
-// results from the bb server) and keeps it live via the plugin's realtime
-// signal plus a refetch on realtime reconnection. It shows what is ACTUALLY
-// up on the estate, not what the source claims should be.
+// The dashboard represents the FULL homelab estate: every entry from the
+// runtime truth map. Publicly reachable services are probed live over HTTP
+// from the bb server; private / source-owned / retired entries are shown as
+// honest inventory with their portfolio status. It keeps live via the plugin's
+// realtime signal plus a refetch on realtime reconnection.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import { REALTIME_CHANNEL, type HomelabSnapshot, type ProbeKind, type ProbeResult, type ProbeStatus } from "./lib/runtime";
+import {
+  REALTIME_CHANNEL,
+  type HomelabSnapshot,
+  type ProbeKind,
+  type ProbeReach,
+  type ProbeResult,
+  type ProbeStatus,
+} from "./lib/runtime";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
-function StatusPill({ tone, label }: { tone: "ok" | "warn" | "bad" | "muted"; label: string }) {
+type Tone = "ok" | "warn" | "bad" | "muted" | "accent";
+
+function StatusPill({ tone, label }: { tone: Tone; label: string }) {
   const cls =
     tone === "ok"
       ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
@@ -22,16 +32,20 @@ function StatusPill({ tone, label }: { tone: "ok" | "warn" | "bad" | "muted"; la
         ? "bg-amber-500/15 text-amber-600 dark:text-amber-400"
         : tone === "bad"
           ? "bg-red-500/15 text-red-600 dark:text-red-400"
-          : "bg-muted text-muted-foreground";
+          : tone === "accent"
+            ? "bg-violet-500/15 text-violet-600 dark:text-violet-400"
+            : "bg-muted text-muted-foreground";
   return (
     <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${cls}`}>{label}</span>
   );
 }
 
-function probeTone(status: ProbeStatus): "ok" | "warn" | "bad" | "muted" {
+function probeTone(status: ProbeStatus): Tone {
   switch (status) {
     case "up":
       return "ok";
+    case "gated":
+      return "accent";
     case "timeout":
       return "warn";
     case "down":
@@ -41,11 +55,35 @@ function probeTone(status: ProbeStatus): "ok" | "warn" | "bad" | "muted" {
   }
 }
 
-function Kpi({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
+const STATUS_LABEL: Record<ProbeStatus, string> = {
+  up: "up",
+  gated: "gated",
+  down: "down",
+  timeout: "timeout",
+  inventory: "inventory",
+};
+
+const REACH_LABEL: Record<ProbeReach, string> = {
+  public: "public",
+  protected: "access-gated",
+  private: "private",
+  none: "not-exposed",
+  retired: "retired",
+};
+
+function Kpi({ label, value, sub, tone }: { label: string; value: string | number; sub?: string; tone?: Tone }) {
+  const valueCls =
+    tone === "bad"
+      ? "text-red-600 dark:text-red-400"
+      : tone === "warn"
+        ? "text-amber-600 dark:text-amber-400"
+        : tone === "ok"
+          ? "text-emerald-600 dark:text-emerald-400"
+          : "";
   return (
     <div className="rounded-lg border bg-card p-3">
       <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="mt-0.5 text-2xl font-semibold tabular-nums">{value}</div>
+      <div className={`mt-0.5 text-2xl font-semibold tabular-nums ${valueCls}`}>{value}</div>
       {sub ? <div className="mt-0.5 text-xs text-muted-foreground">{sub}</div> : null}
     </div>
   );
@@ -89,18 +127,19 @@ function useSnapshot() {
   return { snapshot, loading, error, reload: load };
 }
 
-// Group probes by the host/VM node they live on, preserving a sensible order.
-function groupByHost(probes: ProbeResult[]): Array<{ host: string; items: ProbeResult[] }> {
-  const order: string[] = [];
-  const map = new Map<string, ProbeResult[]>();
-  for (const p of probes) {
-    if (!map.has(p.host)) {
-      map.set(p.host, []);
-      order.push(p.host);
-    }
-    map.get(p.host)!.push(p);
-  }
-  return order.map((host) => ({ host, items: map.get(host)! }));
+// Group the estate into meaningful sections, preserving a stable order.
+const SECTION_ORDER: Array<{ key: string; title: string; match: (p: ProbeResult) => boolean }> = [
+  { key: "service", title: "Core services", match: (p) => p.reach !== "retired" && p.kind === "service" },
+  { key: "app", title: "Apps", match: (p) => p.reach !== "retired" && p.kind === "app" },
+  { key: "remote", title: "Remote nodes", match: (p) => p.reach !== "retired" && p.kind === "remote" },
+  { key: "infra", title: "Infrastructure", match: (p) => p.reach !== "retired" && p.kind === "infra" },
+  { key: "retired", title: "Retired / provenance", match: (p) => p.reach === "retired" },
+];
+
+function sectionize(probes: ProbeResult[]): Array<{ key: string; title: string; items: ProbeResult[] }> {
+  return SECTION_ORDER.map((s) => ({ key: s.key, title: s.title, items: probes.filter(s.match) })).filter(
+    (s) => s.items.length > 0,
+  );
 }
 
 const KIND_LABEL: Record<ProbeKind, string> = {
@@ -108,46 +147,64 @@ const KIND_LABEL: Record<ProbeKind, string> = {
   service: "Service",
   infra: "Infra",
   remote: "Remote",
-  operator: "Operator",
 };
 
 function ProbeRow({ p }: { p: ProbeResult }) {
+  const dim = p.reach === "retired" || p.status === "inventory";
   return (
-    <div className="flex items-center justify-between gap-2 py-1">
+    <div className={`flex items-center justify-between gap-2 py-1.5 ${dim ? "opacity-70" : ""}`}>
       <div className="min-w-0">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <span className="truncate font-medium">{p.name}</span>
           <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{KIND_LABEL[p.kind]}</span>
-          {p.reach === "twingate" ? (
-            <span className="rounded bg-violet-500/15 px-1 text-[10px] font-medium text-violet-600 dark:text-violet-400">private</span>
+          <span className="text-[10px] text-muted-foreground">· {p.host}</span>
+          {p.portfolio !== "active" ? (
+            <span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">{p.portfolio}</span>
+          ) : null}
+          {p.reach !== "public" ? (
+            <span className="rounded bg-violet-500/10 px-1 text-[10px] font-medium text-violet-600 dark:text-violet-400">
+              {REACH_LABEL[p.reach]}
+            </span>
           ) : null}
         </div>
-        <div className="truncate text-xs text-muted-foreground">{p.url}</div>
+        <div className="truncate text-xs text-muted-foreground">{p.url ?? p.note}</div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
         {p.latencyMs != null ? <span className="tabular-nums text-xs text-muted-foreground">{p.latencyMs}ms</span> : null}
-        <StatusPill tone={probeTone(p.status)} label={p.status} />
+        <StatusPill tone={probeTone(p.status)} label={STATUS_LABEL[p.status]} />
       </div>
     </div>
   );
 }
 
+function sectionTone(items: ProbeResult[]): Tone {
+  const probed = items.filter((i) => i.status !== "inventory");
+  if (probed.length === 0) return "muted";
+  const bad = probed.filter((i) => i.status === "down" || i.status === "timeout").length;
+  if (bad === 0) return "ok";
+  return bad === probed.length ? "bad" : "warn";
+}
+
+function sectionLabel(items: ProbeResult[]): string {
+  const live = items.filter((i) => i.status === "up" || i.status === "gated").length;
+  const probed = items.filter((i) => i.status !== "inventory").length;
+  if (probed === 0) return `${items.length} inventory`;
+  return `${live}/${probed} live · ${items.length} total`;
+}
+
 function FullDashboard() {
   const { snapshot, loading, error, reload } = useSnapshot();
 
-  const groups = useMemo(
-    () => (snapshot ? groupByHost(snapshot.probes) : []),
-    [snapshot],
-  );
+  const sections = useMemo(() => (snapshot ? sectionize(snapshot.probes) : []), [snapshot]);
 
   return (
     <div className="p-4 md:p-5">
       <div className="mx-auto w-full max-w-5xl space-y-4">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-lg font-semibold">Homelab — Live State</h1>
+            <h1 className="text-lg font-semibold">Homelab Estate — Live</h1>
             <p className="text-sm text-muted-foreground">
-              Real HTTP probes from the bb server
+              The full portfolio from the runtime truth map · live HTTP probes from the bb server
               {snapshot ? ` · updated ${new Date(snapshot.generatedAt).toLocaleTimeString()}` : ""}
             </p>
           </div>
@@ -164,38 +221,52 @@ function FullDashboard() {
 
         {!snapshot ? (
           <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground">
-            {loading ? "Probing homelab endpoints…" : "No snapshot available."}
+            {loading ? "Probing homelab estate…" : "No snapshot available."}
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Kpi label="Services up" value={`${snapshot.summary.up}/${snapshot.summary.reachable}`} sub={`of ${snapshot.summary.reachable} reachable`} />
-              <Kpi label="Down" value={snapshot.summary.down} sub={snapshot.summary.down ? "needs attention" : "none"} />
-              <Kpi label="Timeout" value={snapshot.summary.timeout} />
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+              <Kpi label="Estate" value={snapshot.summary.total} sub={`${snapshot.summary.active} active`} />
+              <Kpi
+                label="Live"
+                value={`${snapshot.summary.up + snapshot.summary.gated}/${snapshot.summary.probed}`}
+                sub="probed reachable"
+                tone="ok"
+              />
+              <Kpi
+                label="Down"
+                value={snapshot.summary.down}
+                sub={snapshot.summary.down ? "needs attention" : "none"}
+                tone={snapshot.summary.down ? "bad" : undefined}
+              />
+              <Kpi
+                label="Timeout"
+                value={snapshot.summary.timeout}
+                tone={snapshot.summary.timeout ? "warn" : undefined}
+              />
+              <Kpi
+                label="Inventory"
+                value={snapshot.summary.inventory}
+                sub={`${snapshot.summary.reach.private} priv · ${snapshot.summary.reach.none} src`}
+              />
               <Kpi label="Slowest" value={`${snapshot.slowestMs}ms`} />
             </div>
 
-            {groups.map((group) => {
-              const up = group.items.filter((i) => i.status === "up").length;
-              return (
-                <Card key={group.host}>
-                  <CardHeader>
-                    <CardTitle className="flex items-center justify-between text-base">
-                      <span>{group.host}</span>
-                      <StatusPill
-                        tone={up === group.items.length ? "ok" : up > 0 ? "warn" : "bad"}
-                        label={`${up}/${group.items.length} up`}
-                      />
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent className="divide-y text-sm">
-                    {group.items.map((p) => (
-                      <ProbeRow key={p.id} p={p} />
-                    ))}
-                  </CardContent>
-                </Card>
-              );
-            })}
+            {sections.map((section) => (
+              <Card key={section.key}>
+                <CardHeader>
+                  <CardTitle className="flex items-center justify-between text-base">
+                    <span>{section.title}</span>
+                    <StatusPill tone={sectionTone(section.items)} label={sectionLabel(section.items)} />
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="divide-y text-sm">
+                  {section.items.map((p) => (
+                    <ProbeRow key={p.id} p={p} />
+                  ))}
+                </CardContent>
+              </Card>
+            ))}
 
             {snapshot.errors.length > 0 ? (
               <Card>
@@ -213,10 +284,13 @@ function FullDashboard() {
             ) : null}
 
             <p className="text-xs text-muted-foreground">
-              Green = the service answered its health route from the bb server's network. {snapshot.summary.private > 0
-                ? `${snapshot.summary.private} private Twingate/not-exposed routes are listed as inventory only — they can't be probed from this vantage. `
-                : ""}
-              These are live reachability probes, independent of the repo's source claims.
+              <span className="text-emerald-600 dark:text-emerald-400">Green</span> = answered its health route ·{" "}
+              <span className="text-violet-600 dark:text-violet-400">gated</span> = public edge live behind Cloudflare
+              Access ·{" "}
+              <span className="text-red-600 dark:text-red-400">down</span> = no answer on a public route. The{" "}
+              {snapshot.summary.inventory} inventory rows (private Twingate, source-owned/not-exposed, retired) can't be
+              probed from this vantage — that's a portfolio fact, not an outage. Live probes are independent of the
+              repo's source claims.
             </p>
           </>
         )}
@@ -231,7 +305,7 @@ function HomepageSection() {
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
-        <CardTitle>Homelab — Live</CardTitle>
+        <CardTitle>Homelab Estate — Live</CardTitle>
         <Button size="sm" variant="outline" onClick={() => void reload()} disabled={loading}>
           {loading ? "…" : "Refresh"}
         </Button>
@@ -243,21 +317,20 @@ function HomepageSection() {
           <div className="text-muted-foreground">{loading ? "Probing…" : "No snapshot."}</div>
         ) : (
           <>
-            <div className="grid grid-cols-3 gap-2">
-              <Kpi label="Up" value={`${snapshot.summary.up}/${snapshot.summary.reachable}`} />
-              <Kpi label="Down" value={snapshot.summary.down} />
-              <Kpi label="Slowest" value={`${snapshot.slowestMs}ms`} />
+            <div className="grid grid-cols-4 gap-2">
+              <Kpi label="Estate" value={snapshot.summary.total} />
+              <Kpi label="Live" value={`${snapshot.summary.up + snapshot.summary.gated}/${snapshot.summary.probed}`} tone="ok" />
+              <Kpi label="Down" value={snapshot.summary.down} tone={snapshot.summary.down ? "bad" : undefined} />
+              <Kpi label="Inventory" value={snapshot.summary.inventory} />
             </div>
             <div className="flex flex-wrap items-center gap-2 text-xs">
-              {snapshot.probes.slice(0, 8).map((p) => (
-                <StatusPill
-                  key={p.id}
-                  tone={p.reach === "twingate" ? "muted" : probeTone(p.status)}
-                  label={p.reach === "twingate" ? `${p.name} · private` : p.name}
-                />
-              ))}
-              {snapshot.probes.length > 8 ? (
-                <StatusPill tone="muted" label={`+${snapshot.probes.length - 8} more`} />
+              {snapshot.probes
+                .filter((p) => p.status !== "inventory")
+                .map((p) => (
+                  <StatusPill key={p.id} tone={probeTone(p.status)} label={p.name} />
+                ))}
+              {snapshot.summary.inventory > 0 ? (
+                <StatusPill tone="muted" label={`+${snapshot.summary.inventory} inventory`} />
               ) : null}
             </div>
             <Button
@@ -266,7 +339,7 @@ function HomepageSection() {
               className="px-0"
               onClick={() => window.location.assign("#/plugins/homepage-dashboard")}
             >
-              Open full live view →
+              Open full estate view →
             </Button>
           </>
         )}
@@ -278,13 +351,13 @@ function HomepageSection() {
 export default definePluginApp((app) => {
   app.slots.homepageSection({
     id: "homepage-dashboard",
-    title: "Homelab — Live",
+    title: "Homelab Estate — Live",
     component: HomepageSection,
   });
 
   app.slots.navPanel({
     id: "dashboard",
-    title: "Homelab — Live",
+    title: "Homelab Estate",
     icon: "Activity",
     path: "dashboard",
     component: FullDashboard,

@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "Homelab Live Dashboard",
-    "description": "A homepage section and nav panel showing the LIVE state of the homelab estate — real HTTP health probes of services, VMs, and remote nodes (OpenClaw, Basic Memory, Home Assistant, n8n, SearXNG, Kaneo, Gitea, Immich, blog), refreshed on an interval and over realtime.",
+    "description": "A homepage section and nav panel representing the FULL homelab estate — every entry from the runtime truth map (apps, services, remote nodes, infra, retired), grouped by category, with real HTTP health probes of what's publicly reachable and honest inventory for private/source-owned/retired routes. Refreshed on an interval and over realtime.",
     "branding": {
       "icon": "Activity"
     },
