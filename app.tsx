@@ -429,7 +429,7 @@ function FullDashboard() {
   const s = snapshot?.summary;
 
   return (
-    <div className="p-4 md:p-5">
+    <div className="h-full overflow-y-auto p-4 md:p-5">
       <div className="mx-auto w-full max-w-5xl space-y-4">
         <div className="flex items-center justify-between">
           <div>
