@@ -106,8 +106,8 @@ export const HOMELAB_TARGETS: ProbeTarget[] = [
     kind: "service",
     host: "T730",
     portfolio: "active",
-    url: null,
-    note: "bazarr/prowlarr/qbit/radarr/shadow/sonarr behind Cloudflare Access (truth-map: t730-arr-stack).",
+    url: "https://prowlarr.iris-kernel.net/ping",
+    note: "Prowlarr probed as the stack's representative (bazarr/prowlarr/qbit/radarr/sonarr, all one Cloudflare Access app) — truth-map: t730-arr-stack.",
     reach: "protected",
   },
 

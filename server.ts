@@ -39,9 +39,10 @@ export const rpcContract = defineRpcContract({
 });
 
 interface FetchLike {
-  (input: string, init?: { signal?: AbortSignal }): Promise<{
+  (input: string, init?: { signal?: AbortSignal; redirect?: "manual" | "follow" }): Promise<{
     ok: boolean;
     status: number;
+    headers?: { get(name: string): string | null };
   }>;
 }
 
@@ -83,9 +84,15 @@ async function probeOne(target: ProbeTarget, fetchFn: FetchLike): Promise<ProbeR
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
     let httpStatus: number | null = null;
+    let location: string | null = null;
     try {
-      const res = await fetchFn(url, { signal: controller.signal });
+      // redirect: "manual" is essential — otherwise fetch follows a Cloudflare
+      // Access 302 all the way to its login page, which returns HTTP 200, and
+      // we would falsely report an Access-walled service as "up". Manual lets
+      // us see the real 3xx and read where it points.
+      const res = await fetchFn(url, { signal: controller.signal, redirect: "manual" });
       httpStatus = res.status;
+      location = res.headers?.get?.("location") ?? null;
     } finally {
       clearTimeout(timer);
     }
@@ -94,15 +101,18 @@ async function probeOne(target: ProbeTarget, fetchFn: FetchLike): Promise<ProbeR
     const ok = code >= 200 && code < 300;
     // A redirect or auth wall (3xx / 401 / 403) means the edge answered — the
     // ingress/tunnel is live, just behind Cloudflare Access from this vantage.
-    // That is "gated", never a false "down". Only a hard 4xx/5xx or a
+    // That is "gated", never a false "up" or "down". Only a hard 4xx/5xx or a
     // connection error is a real outage signal. This is reach-independent so a
     // documented-public route that redirects here isn't misreported.
     const gated = !ok && (code === 401 || code === 403 || (code >= 300 && code < 400));
+    const access = !!location && location.includes("cloudflareaccess.com");
     const status: ProbeStatus = ok ? "up" : gated ? "gated" : "down";
     const detail = ok
       ? null
       : gated
-        ? `edge live · auth wall (HTTP ${code})`
+        ? access
+          ? "edge live · behind Cloudflare Access"
+          : `edge live · redirect/auth wall (HTTP ${code})`
         : `HTTP ${httpStatus ?? "?"}`;
     return { ...base(target), status, httpStatus, latencyMs, detail };
   } catch (err) {
